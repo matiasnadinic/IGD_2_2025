@@ -1,0 +1,384 @@
+---
+title: "Geografía del Capital Humano y Género: Un Análisis Espacial Bivariado de la Provincia de Valparaíso (Censo 2017)"
+author: "Matías Nadinic Bravo"
+date: "2025-10-20"
+output: html_document
+---
+
+
+# 1\. Introducción
+
+Los territorios no son espacios neutros. Su configuración responde a dinámicas demográficas y a la concentración de capital humano, factores que determinan las oportunidades y el desarrollo. La planificación urbana y regional, históricamente, ha respondido a centros económicos que concentran servicios y empleo calificado.
+
+El análisis del "porcentaje de profesionales" permite identificar estos polos de capital humano, que usualmente coinciden con los principales núcleos urbanos. Por otro lado, la distribución de la población por género ("porcentaje de mujeres") revela patrones demográficos estructurales, ligados a la migración, la estructura laboral y la conformación de los hogares.
+
+En las últimas décadas, la participación de las mujeres en la educación superior y en el mercado laboral ha crecido sostenidamente. Sin embargo, esta participación no es homogénea en el territorio, y su relación con la concentración general de "profesionales" no es lineal, mereciendo un análisis espacial que identifique patrones de co-localización.
+
+En función de lo anterior, el presente trabajo tiene como objetivo visibilizar las dinámicas territoriales que emergen al cruzar dos variables clave en la **Provincia de Valparaíso**: el **porcentaje de profesionales** y el **porcentaje de mujeres**. Se analizan estas dos dimensiones críticas para identificar zonas donde distintas combinaciones de estas variables revelan patrones de concentración urbana, dinámicas periurbanas o características rurales.
+
+Este análisis ofrece una base territorial para comprender cómo se manifiestan estas estructuras sociodemográficas en el espacio.
+
+## 1.1. Objetivo General
+
+El objetivo general de este trabajo es analizar la distribución territorial del porcentaje de profesionales y el porcentaje de mujeres en la Provincia de Valparaíso, y su relación espacial conjunta.
+
+## 1.2. Objetivos Específicos
+
+Los objetivos específicos por trabajar son:
+
+  - Calcular y representar espacialmente el indicador "% de Mujeres" en la Provincia de Valparaíso.
+  - Calcular y representar espacialmente el indicador "% de Profesionales" en la Provincia de Valparaíso.
+  - Estudiar la correlación estadística entre ambas variables mediante un gráfico de dispersión.
+  - Identificar patrones conjuntos de concentración o carencia mediante un análisis de mapa bivariado, detallando las comunas involucradas.
+
+## 1.3. Área de Estudio
+La Provincia de Valparaíso es una de las ocho provincias que componen la Región de Valparaíso en Chile. Es el corazón administrativo y demográfico de la región, y un territorio de fuertes contrastes.Con una superficie continental de $2.780 \text{ km}^2$, la provincia albergaba a $751.317$ habitantes según el Censo 2017. Esto le confiere una densidad poblacional de $262,3 \text{ hab/km}^2$, significativamente más alta que el promedio regional ($110,7 \text{ hab/km}^2$), evidenciando su carácter predominantemente urbano.Geográficamente, la provincia se define por una marcada dicotomía que la hace un caso de estudio relevante.Núcleo Metropolitano: Alberga el "Gran Valparaíso", que consolida las comunas de Valparaíso (capital regional con $296.655$ habitantes en 2017), Viña del Mar y Concón. Esta conurbación funciona como el principal polo de servicios, educación superior y empleo de la región.Cordón Industrial-Costero: Incluye las comunas de Quintero y Puchuncaví, conocidas por albergar un complejo portuario e industrial.Valle Interior (Rural): Está representado por la comuna de Casablanca, un extenso territorio interior dominado por el mundo agrícola y vitivinícola, que contrasta con la alta densidad del resto de la provincia. La población rural a nivel regional representa solo el $8.4\%$ del total.Este trabajo se centra en el territorio continental de la provincia, excluyendo los distritos insulares de Juan Fernández, tal como se define en la metodología. Esta estructura tripartita (núcleo metropolitano, zona industrial y área rural) genera dinámicas sociales y económicas únicas, ideales para analizar cómo se distribuye el capital humano y la población.
+
+-----
+
+# 2\. Desarrollo
+
+## 2.1. Metodología
+
+La metodología de este trabajo consiste en la extracción de datos del Censo 2017 desde una base de datos PostgreSQL (`pgAdmin`). Luego, se utiliza `R` y `RStudio` para procesar, unir y visualizar estos datos.
+
+### **Bloque 1: Carga de Librerías**
+
+*En este bloque, se cargan todas las "cajas de herramientas" (librerías) que R necesita para trabajar. `DBI` y `RPostgres` permiten la conexión a la base de datos. `sf` es fundamental para manejar datos espaciales (los polígonos de los mapas). `ggplot2` es la librería principal para crear los gráficos. `cowplot` y `biscale` se usan específicamente para el mapa bivariado. `stringr` es una utilidad para limpiar texto.*
+
+```{r setup, message=FALSE, warning=FALSE, echo=TRUE}
+# =============================================================================
+# 1) CARGAR LIBRERÍAS NECESARIAS
+# =============================================================================
+library(DBI)
+library(RPostgres)
+library(sf)
+library(ggplot2)
+library(cowplot)
+library(biscale)
+library(stringr) 
+```
+
+### **Bloque 2: Conexión a Base de Datos**
+
+*Aquí, establecemos la conexión con la base de datos local de PostgreSQL que contiene los datos del censo. Se especifican el nombre de la base de datos (`censo_v_2017`), el host (`localhost`), el usuario y la contraseña.*
+
+```{r conexion, message=FALSE, warning=FALSE, echo=TRUE}
+# =============================================================================
+# 2) CONEXIÓN A BASE DE DATOS
+# =============================================================================
+con <- dbConnect(
+  RPostgres::Postgres(),
+  dbname = "censo_v_2017",
+  host = "localhost",
+  port = 5432,
+  user = "postgres",
+  password = "postgres"
+)
+```
+
+### **Bloque 3: Consulta SQL y Cálculo de Indicadores**
+
+*Este es el corazón del análisis de datos. Se envía una consulta SQL a la base de datos para calcular nuestros dos indicadores principales por cada zona censal (`geocodigo`).*
+*-   **`tasa_profesionales`**: Se calcula contando a las personas con educación universitaria completa, magíster o doctorado (`p.p15 >= 12 AND p.p15 <= 14`) y dividiéndolo por la población mayor de 18 años (`p.p09 > 18`).*
+*-   **`porcentaje_mujeres`**: Se calcula contando a las personas de sexo femenino (`p.p08 = 2`) y dividiéndolo por la población total de esa zona.*
+*El resultado se guarda en un dataframe llamado `df_profesional_mujeres`.*
+
+```{r consulta_sql, message=FALSE, warning=FALSE, echo=TRUE}
+# =============================================================================
+# 3) CONSULTA SQL: Porcentaje de Profesionales y mujeres
+# =============================================================================
+df_profesional_mujeres <- dbGetQuery(con, "
+SELECT 
+  z.geocodigo,
+  c.nom_comuna, 
+  COUNT(*) FILTER (WHERE p.p15 >= 12 AND p.p15 <= 14) AS total_profesionales,
+  ROUND(
+    COUNT(*) FILTER (WHERE p.p15 >= 12 AND p.p15 <= 14) * 100.0 /
+    COUNT(*) FILTER (WHERE p.p09 > 18),
+    2
+  ) AS tasa_profesionales,
+  COUNT(*) FILTER (WHERE p.p08 = 2) AS total_mujeres,
+  ROUND(
+    COUNT(*) FILTER (WHERE p.p08 = 2) * 100.0 /
+    COUNT(*),
+    2
+  ) AS porcentaje_mujeres
+FROM personas p
+JOIN hogares h ON h.hogar_ref_id = p.hogar_ref_id 
+JOIN viviendas v ON h.vivienda_ref_id = v.vivienda_ref_id 
+JOIN zonas z ON z.zonaloc_ref_id = v.zonaloc_ref_id
+JOIN comunas c ON z.codigo_comuna = c.codigo_comuna 
+GROUP BY z.geocodigo, c.nom_comuna
+ORDER BY tasa_profesionales DESC;
+")
+```
+
+### **Bloque 4: Carga de Geometrías (Mapas)**
+
+*Ahora que tenemos los números, necesitamos los mapas (polígonos). Esta consulta SQL extrae las geometrías (`geom`) de las zonas censales de la Provincia de Valparaíso (provincia '51'). Es importante notar que se excluyen las comunas '51501' (Juan Fernández) y '52701' (Isla de Pascua), ya que el análisis se centra en el territorio continental.*
+
+```{r carga_geometria, message=FALSE, warning=FALSE, echo=TRUE}
+# =============================================================================
+# 4) CARGAR GEOMETRÍA DE ZONAS CENSALES - PROVINCIA DE VALPARAÍSO CONTINENTAL
+# =============================================================================
+sql_geometria <- "
+SELECT
+  geocodigo::text AS geocodigo,
+  geom,
+  nom_comuna
+FROM dpa.zonas_censales_v
+WHERE 
+  nom_region ILIKE 'REGIÓN DE VALPARAÍSO'
+  AND provincia = '51' 
+  AND comuna NOT IN ('51501', '52701');
+"
+
+sf_zonas <- st_read(con, query = sql_geometria)
+cat('Zonas cargadas:', nrow(sf_zonas), '\n')
+```
+
+### **Bloque 5: Unión de Datos y Geometrías**
+
+*Este es un paso crucial de limpieza. Los `geocodigo` (la llave que une los datos con los mapas) pueden tener problemas (ej. "1234" vs "001234"). Este código se asegura de que ambos `geocodigo` (el de los datos y el del mapa) sean texto y tengan exactamente 11 dígitos, rellenando con ceros a la izquierda si es necesario (`str_pad`). Finalmente, `merge` une la tabla de datos (`df_profesional_mujeres`) con el objeto espacial (`sf_zonas`), creando nuestro set de datos final listo para mapear (`sf_mapa`).*
+
+```{r merge_datos, message=FALSE, warning=FALSE, echo=TRUE}
+# =============================================================================
+# 5) COMBINAR DATOS TABULARES Y ESPACIALES
+# =============================================================================
+
+sf_zonas$geocodigo <- as.character(sf_zonas$geocodigo)
+df_profesional_mujeres$geocodigo <- as.character(df_profesional_mujeres$geocodigo)
+
+sf_zonas$geocodigo <- str_pad(str_trim(sf_zonas$geocodigo), 11, pad = "0")
+df_profesional_mujeres$geocodigo <- str_pad(str_trim(df_profesional_mujeres$geocodigo), 11, pad = "0")
+
+sf_mapa <- merge(sf_zonas, df_profesional_mujeres, by = "geocodigo", all.x = TRUE)
+```
+
+-----
+
+## 2.2 Análisis y Resultados
+
+A partir del objeto `sf_mapa` creado, ahora podemos generar las visualizaciones.
+
+### **Bloque 6: Mapas Temáticos Univariados**
+
+*En este bloque se generan los dos primeros mapas (Figuras 1 y 2). Se define un filtro (`ultramar_codigos`) para asegurar que solo se mapea el continente. Se definen coordenadas manuales (`X_MIN_VALPO`, etc.) para "acercar" la cámara al área de interés y no mostrar todo el océano. Finalmente, se usa `ggplot` y `geom_sf` para dibujar los polígonos, rellenándolos con el color correspondiente a cada indicador (`tasa_profesionales` y `porcentaje_mujeres`).*
+
+```{r mapas_tematicos, message=FALSE, warning=FALSE, echo=TRUE, fig.cap="Figura 1 (Izquierda): % Profesionales. Figura 2 (Derecha): % Mujeres."}
+# =============================================================================
+# 6) MAPAS TEMÁTICOS - PROVINCIA DE VALPARAÍSO CONTINENTAL
+# =============================================================================
+
+ultramar_codigos <- c("51501", "52701") 
+sf_mapa_continental <- sf_mapa[
+  !substr(sf_mapa$geocodigo, 1, 5) %in% ultramar_codigos, 
+]
+
+# --- Definir límites manuales para la visualización continental (FORZADO) ---
+X_MIN_VALPO <- -71.75 
+X_MAX_VALPO <- -71.20 
+Y_MIN_VALPO <- -33.60 
+Y_MAX_VALPO <- -32.50 
+
+map_profesionales <- ggplot(sf_mapa_continental) +
+  geom_sf(aes(fill = tasa_profesionales), color = "gray80", size = 0.005) +
+  scale_fill_viridis_c(option = "C", na.value = "gray90") +
+  labs(title = "% de Profesionales Provincia de Valparaíso", fill = "%") +
+  coord_sf(
+    xlim = c(X_MIN_VALPO, X_MAX_VALPO),
+    ylim = c(Y_MIN_VALPO, Y_MAX_VALPO),
+    expand = FALSE
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+map_mujeres <- ggplot(sf_mapa_continental) +
+  geom_sf(aes(fill = porcentaje_mujeres), color = "gray80", size = 0.005) +
+  scale_fill_viridis_c(option = "C", na.value = "gray90") +
+  labs(title = "% de Mujeres Provincia de Valparaíso", fill = "%") +
+  coord_sf(
+    xlim = c(X_MIN_VALPO, X_MAX_VALPO),
+    ylim = c(Y_MIN_VALPO, Y_MAX_VALPO),
+    expand = FALSE
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# Imprimimos los mapas
+print(map_profesionales)
+print(map_mujeres)
+```
+
+**Análisis Mapas 1 y 2:**
+El mapa de **% de Mujeres** (Figura 2) muestra una distribución bastante homogénea, con la mayoría de las zonas en rangos medios-altos (colores naranja y amarillo). Esto es coherente con los datos regionales que muestran un leve superávit de población femenina.
+Por el contrario, el mapa de **% de Profesionales** (Figura 1) es **extremadamente heterogéneo**. Está dominado por el color púrpura oscuro (bajos profesionales), con una notable excepción: un *cluster* de alto valor (amarillo) en la costa, alrededor de los 33.0°S, que corresponde al Gran Valparaíso.
+
+-----
+
+### **Bloque 7: Gráfico de Dispersión por Cuadrantes**
+
+*Aquí se crea el gráfico de dispersión (Figura 3). Primero, se calculan las **medianas** (el valor central) de ambas tasas. Estas medianas se usan para trazar las líneas punteadas (`geom_vline` y `geom_hline`) que dividen el gráfico en cuatro cuadrantes. Luego, se asigna a cada zona censal a uno de los cuatro cuadrantes (ej. "Alta tasa / Alto % mujeres") y se colorean los puntos según esta clasificación.*
+
+```{r dispersion, message=FALSE, warning=FALSE, echo=TRUE, fig.cap="Figura 3: Dispersión % Profesionales vs % Mujeres."}
+# =============================================================================
+# 7) GRÁFICO DE DISPERSIÓN POR CUADRANTES
+# =============================================================================
+if(length(unique(sf_mapa_continental$tasa_profesionales[!is.na(sf_mapa_continental$tasa_profesionales)])) > 1 &
+   length(unique(sf_mapa_continental$porcentaje_mujeres[!is.na(sf_mapa_continental$porcentaje_mujeres)])) > 1) {
+  
+  mediana_profesionales <- median(sf_mapa_continental$tasa_profesionales, na.rm = TRUE)
+  mediana_mujeres <- median(sf_mapa_continental$porcentaje_mujeres, na.rm = TRUE)
+  
+  sf_mapa_continental$cuadrante <- with(sf_mapa_continental, ifelse(
+    tasa_profesionales >= mediana_profesionales & porcentaje_mujeres >= mediana_mujeres, 'Alta tasa / Alto % mujeres',
+    ifelse(tasa_profesionales >= mediana_profesionales & porcentaje_mujeres < mediana_mujeres, 'Alta tasa / Bajo % mujeres',
+           ifelse(tasa_profesionales < mediana_profesionales & porcentaje_mujeres < mediana_mujeres, 'Baja tasa / Bajo % mujeres',
+                  'Baja tasa / Alto % mujeres'))))
+  
+  grafico_dispersion <- ggplot(sf_mapa_continental, aes(x = tasa_profesionales, y = porcentaje_mujeres, color = cuadrante)) +
+    geom_point(size = 2) +
+    geom_vline(xintercept = mediana_profesionales, linetype = "dashed") +
+    geom_hline(yintercept = mediana_mujeres, linetype = "dashed") +
+    scale_color_manual(values = c(
+      'Alta tasa / Alto % mujeres' = '#08519c',
+      'Alta tasa / Bajo % mujeres' = '#6baed6',
+      'Baja tasa / Bajo % mujeres' = '#eff3ff',
+      'Baja tasa / Alto % mujeres' = '#bdd7e7'
+    )) +
+    labs(x = "% Profesionales", y = "% Mujeres", title = "Dispersión: % Profesionales vs % Mujeres") +
+    theme_minimal()
+  
+  print(grafico_dispersion)
+} else {
+  mediana_profesionales <- NA
+  mediana_mujeres <- NA
+  warning("No hay suficientes valores únicos para calcular medianas.")
+}
+```
+
+**Análisis Dispersión:**
+El gráfico de dispersión (Figura 3) confirma visualmente la heterogeneidad. La gran mayoría de los puntos (zonas censales) se aglomeran en el lado izquierdo ("Baja tasa" de profesionales). Los pocos puntos con "Alta tasa" se distribuyen tanto por encima como por debajo de la mediana de % de mujeres.
+
+-----
+
+### **Bloque 8: Mapa Bivariado (Combinado)**
+
+*Este es el bloque más complejo. Primero, se usa la función `bi_class` de la librería `biscale` para clasificar cada zona censal en una grilla de 2x2, usando el estilo `quantile` (que parte por la mediana, igual que el gráfico anterior). Segundo, se crea el `mapa_bivariado_plot` usando `ggplot`. Tercero, se crea la `leyenda_bivariada` por separado. Finalmente, se usa la función `ggdraw` de `cowplot` para "pegar" la leyenda encima del mapa y crear la visualización final (Figura 4).*
+
+```{r mapa_bivariado, message=FALSE, warning=FALSE, echo=TRUE, fig.cap="Figura 4: Mapa Bivariado % Profesionales vs % Mujeres."}
+# =============================================================================
+# 8) MAPA BIVARIADO CON BISCALE - SOLUCIÓN ESTÁNDAR (CON ETIQUETAS EJE)
+# =============================================================================
+
+# --- 1️⃣ Clasificación estándar por Cuantiles (2x2) ---
+sf_mapa_bi <- bi_class(
+  sf_mapa_continental, 
+  x = tasa_profesionales, 
+  y = porcentaje_mujeres, 
+  dim = 2, 
+  style = "quantile" 
+)
+
+# --- 4️⃣ Crear mapa bivariado SIN etiquetas de comunas y con grilla ---
+mapa_bivariado_plot <- ggplot() +
+  geom_sf(data = sf_mapa_bi, aes(fill = bi_class), color = NA) +
+  geom_sf(data = sf_mapa_continental, fill = NA, color = 'black', size = 0.005) +
+  theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = 'bold', size = 16),
+    panel.background = element_rect(fill = "white", color = NA),
+    panel.grid.major = element_line(color = "gray80", linetype = "dotted", linewidth = 0.2)
+  ) +
+  bi_scale_fill(pal = 'DkBlue', dim = 2) + 
+  labs(title = '% Profesionales vs % Mujeres Provincia Valparaíso') +
+  coord_sf(
+    xlim = c(X_MIN_VALPO, X_MAX_VALPO), 
+    ylim = c(Y_MIN_VALPO, Y_MAX_VALPO), 
+    expand = FALSE
+  )
+
+# --- 5️⃣ Crear leyenda bivariada con etiquetas EJE ---
+leyenda_bivariada <- bi_legend(
+  pal = 'DkBlue', dim = 2, 
+  xlab = '% Profesionales →', 
+  ylab = '% Mujeres →', 
+  size = 8
+)
+
+# --- 6️⃣ Combinar mapa + leyenda (Centrado y maximizado) ---
+mapa_final <- ggdraw() +
+  draw_plot(mapa_bivariado_plot, x = 0, y = 0, width = 1, height = 1) + 
+  draw_plot(leyenda_bivariada, x = 0.75, y = 0.05, width = 0.2, height = 0.2) 
+
+# --- 7️⃣ Mostrar mapa final ---
+print(mapa_final)
+```
+
+**Análisis Mapa Bivariado:**
+El mapa bivariado (Figura 4) revela patrones geográficos claros que el análisis univariado no muestra. El territorio se divide en cuatro perfiles sociodemográficos distintos que coinciden con las comunas de la provincia:
+
+1.  **El Núcleo Metropolitano: `Clase Alto-Alto` (Azul Oscuro)**
+    El *cluster* más denso y notorio de color azul oscuro se ubica en la costa (33.0°S). Esta área representa el corazón del **Gran Valparaíso** (**Valparaíso**, **Viña del Mar** y **Concón**). Siendo el principal centro urbano, de servicios y universitario, es esperable que concentre la mayor cantidad de **"Alto % Profesionales"**. A su vez, como polo de atracción laboral (servicios), presenta un **"Alto % Mujeres"**.
+
+2.  **Las Zonas Industriales y Portuarias: `Clase Alto-Bajo` (Cian)**
+    Los manchones de color cian se ubican en la periferia del núcleo azul y en la costa norte. Estas zonas corresponden a sectores industriales dentro de **Concón** (Refinería) y a las áreas portuarias e industriales de **Quintero** y **Puchuncaví**. Estas áreas albergan industrias (refinerías, termoeléctricas) que demandan mano de obra calificada (**"Alto % Profesionales"**), pero que históricamente tienen un perfil laboral masculino (**"Bajo % Mujeres"**).
+
+3.  **Las Cabeceras Comunales Secundarias: `Clase Bajo-Alto` (Gris/Azul claro)**
+    Las zonas de este color se agrupan en dos áreas: (1) al sur, correspondiendo al pueblo principal de **Casablanca**, y (2) en la costa norte, correspondiendo a las áreas urbanas residenciales de **Quintero** y **Puchuncaví**. Al no ser centros universitarios, tienen un **"Bajo % Profesionales"** residentes. Sin embargo, como núcleos urbanos que concentran población, retienen un **"Alto % Mujeres"**.
+
+4.  **El Interior Rural: `Clase Bajo-Bajo` (Gris claro)**
+    Finalmente, las grandes extensiones de color gris claro dominan el interior. Corresponden al interior agrícola de **Casablanca** y las zonas rurales de **Puchuncaví** y **Quintero**. Estas áreas rurales (8.4% de la población regional) se caracterizan por tener un **"Bajo % Profesionales"** y un **"Bajo % Mujeres"**.
+
+-----
+
+### **Bloque 9: Cierre de Conexión**
+
+*Es una buena práctica cerrar explícitamente la conexión a la base de datos una vez que ya no se necesita.*
+
+```{r cierre, message=FALSE, warning=FALSE, echo=TRUE}
+# =============================================================================
+# 9) CIERRE DE CONEXIÓN
+# =============================================================================
+dbDisconnect(con)
+cat("Conexión cerrada correctamente.\n")
+```
+
+-----
+
+# 3\. Conclusión
+---
+
+Para concluir, el presente trabajo permitió cumplir exitosamente el objetivo general de analizar territorialmente la relación entre el porcentaje de profesionales y el porcentaje de mujeres en la Provincia de Valparaíso, mediante una metodología reproducible que combinó la extracción de datos desde pgAdmin con su visualización geoespacial en RStudio.
+
+Los patrones espaciales identificados reflejan una dinámica socioeconómica compleja y diferenciada:  
+- Una alta concentración simultánea de capital humano profesional y población femenina (Alto-Alto), restringida principalmente al núcleo metropolitano de Viña del Mar, Valparaíso y Concón.  
+- Zonas industriales con alta presencia profesional pero baja población femenina residente (Alto-Bajo), localizadas en Concón, Quintero y Puchuncaví.  
+- Cabeceras comunales secundarias (Bajo-Alto), como Casablanca, Quintero y Puchuncaví, que funcionan como centros residenciales con alta población femenina pero escaso capital profesional.  
+- Un vasto interior rural (Bajo-Bajo) en Casablanca y las comunas del norte, caracterizado por bajos niveles en ambos indicadores.
+
+Este análisis bivariado demuestra ser una herramienta valiosa para la planificación territorial, ya que permite diseñar políticas públicas específicas según las características locales. Por ejemplo, en las zonas rurales con baja presencia de profesionales y mujeres (Bajo-Bajo), se pueden implementar programas de capacitación laboral y fomento de la participación femenina para potenciar el desarrollo económico y social. En las zonas industriales con alta presencia profesional pero baja población femenina (Alto-Bajo), es relevante promover medidas para mejorar la integración social y residencial de las mujeres, como facilitar infraestructura habitacional, servicios de cuidado y movilidad. En las cabeceras comunales con alta población femenina pero bajo capital profesional (Bajo-Alto), se recomienda incentivar la educación superior y oportunidades laborales para las mujeres, contribuyendo a equilibrar la composición socioeconómica local.
+
+Así, esta planificación diferenciada basada en análisis espacial permite optimizar recursos y estrategias, fomentando un desarrollo territorial más equitativo y sostenible.
+
+-----
+
+# 4\. Bibliografía
+
+* **[1.1]** Biblioteca del Congreso Nacional de Chile. (s.f.). *Reporte Comunal: Valparaíso (2021)*. Obtenido de BCN.cl: [https://www.bcn.cl/siit/reportescomunales/comunas_v.html?anno=2021&idcom=5101](https://www.bcn.cl/siit/reportescomunales/comunas_v.html?anno=2021&idcom=5101)
+* **[1.2]** Biblioteca del Congreso Nacional de Chile. (s.f.). *Reporte Comunal: Valparaíso (2017)*. Obtenido de BCN.cl: [https://www.bcn.cl/siit/reportescomunales/comunas_v.html?anno=2017&idcom=5101](https://www.bcn.cl/siit/reportescomunales/comunas_v.html?anno=2017&idcom=5101)
+* **[1.3]** Sistema Integrado de Información Territorial. (s.f.). *Provincia Valparaíso - Mapoteca*. Obtenido de BCN.cl: [https://www.bcn.cl/siit/mapoteca/provincia_view?dato=Valpara%C3%ADso](https://www.bcn.cl/siit/mapoteca/provincia_view?dato=Valpara%C3%ADso)
+* **[2.1]** Subsecretaría de Desarrollo Regional y Administrativo (SUBDERE). (s.f.). *Gobierno Regional de Valparaíso*. Obtenido de [https://www.subdere.gov.cl/divisi%C3%B3n-administrativa-de-chile/gobierno-regional-de-valpara%C3%ADso](https://www.subdere.gov.cl/divisi%C3%B3n-administrativa-de-chile/gobierno-regional-de-valpara%C3%ADso)
+* **[2.2]** V Región de Valparaíso, Chile. (s.f.). *Provincia de Valparaiso*. Obtenido de [http://www.vregion.cl/valparaiso/](http://www.vregion.cl/valparaiso/)
+* **[3.2]** V Región de Valparaíso, Chile. (s.f.). *Datos*. Obtenido de [http://www.vregion.cl/datos/](http://www.vregion.cl/datos/)
+* **[3.4]** Instituto Nacional de Estadísticas (INE). (s.f.). *DIVISIÓN POLÍTICO ADMINISTRATIVA Y CENSAL REGIÓN DE VALPARAÍSO*. Obtenido de [https://geoarchivos.ine.cl/File/pub/poblaci%C3%B3n-y-vivienda-valpara%C3%ADso.pdf](https://geoarchivos.ine.cl/File/pub/poblaci%C3%B3n-y-vivienda-valpara%C3%ADso.pdf)
+* **[4.4]** Instituto Nacional de Estadísticas (INE). (2017). *Resultados CENSO 2017 - Por país, regiones y comunas*. Obtenido de [http://resultados.censo2017.cl/Region?R=R05](http://resultados.censo2017.cl/Region?R=R05)
