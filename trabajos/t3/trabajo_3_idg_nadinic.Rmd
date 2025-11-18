@@ -1,0 +1,492 @@
+---
+title: "trabajo 3: Microsimulación + Clusters"
+author: "Matías Nadinic Bravo"
+date: "2025-11-18"
+output: html_document
+---
+
+```         
+```
+
+# 1. Introducción
+
+La estructura urbana del Gran Santiago se caracteriza por una marcada segregación socioespacial que históricamente ha dividido la ciudad entre un cono de alta renta y una periferia de mayor vulnerabilidad. Comprender las dinámicas actuales de esta segregación requiere ir más allá de los indicadores tradicionales, integrando variables que midan la exclusión estructural (como el analfabetismo) y los cambios demográficos recientes (como la migración).
+
+El principal desafío para analizar estos fenómenos a escala intra-urbana (barrio) es la falta de datos granulares. El Censo proporciona información demográfica universal (totales) pero carece de la granularidad socioeconómica necesaria para el perfilamiento. Para cerrar esta brecha, el presente trabajo recurre a la Microsimulación Espacial (Raking) para generar estimaciones fiables del analfabetismo a nivel de zona censal, basándose en la Encuesta CASEN.
+
+El objetivo es integrar esta estimación simulada con variables reales del Censo (migración y rezago escolar) para construir una tipología de barrios. Esta tipología será analizada mediante el Clustering K-Means, y su variabilidad interna será medida mediante el Índice de Entropía de Shannon, permitiendo identificar si las comunas son socialmente homogéneas (segregadas) o heterogéneas (mezcladas).
+
+## **1.1. Objetivo General**
+
+Analizar la estructura socioespacial del Gran Santiago mediante la integración de datos censales y encuestas de hogares, identificando patrones de segregación y heterogeneidad territorial.
+
+## **1.2. Objetivos Específicos**
+
+-   Estimar la tasa de analfabetismo a nivel de zona censal mediante técnicas de Microsimulación Espacial (algoritmo Iterative Proportional Fitting).
+
+-   Tipificar los territorios del Gran Santiago en perfiles socioeconómicos distintivos mediante análisis de Clúster (K-Means).
+
+-   Evaluar el grado de mezcla o segregación interna de las comunas utilizando el Índice de Entropía de Shannon.
+
+    # **2. Marco Teórico Referencial**
+
+Para abordar la complejidad territorial, este estudio se apoya en tres pilares metodológicos y conceptuales:
+
+## **2.1. Microsimulación Espacial (Spatial Microsimulation)**
+
+Es una técnica estadística que permite generar una población sintética para áreas geográficas pequeñas. Se utiliza el método de Raking que re-pondera los individuos de la encuesta (CASEN) para que coincidan con los totales marginales del Censo, permitiendo estimar variables "ocultas" (como el analfabetismo detallado) en el territorio.
+
+## **2.2. Análisis de Clúster (K-Means)**
+
+Es un método no supervisado que agrupa objetos (zonas censales) basándose en su similitud estadística, minimizando la varianza dentro del grupo y maximizando la diferencia entre grupos, lo que permite identificar "tipologías de barrio".
+
+## **2.3. Índice de Entropía de Shannon (**$H$**)**
+
+Este índice se utiliza para medir la diversidad o mezcla de los clústeres al interior de cada comuna. Un valor alto de $H$ indica una comuna heterogénea (múltiples perfiles), mientras que un valor bajo indica homogeneidad o segregación (predominio de un solo grupo social).
+
+# **3. Metodología y Procesamiento de Datos**
+
+## **3.1. Carga de Librerías y Configuración**
+
+Se utilizan librerías especializadas para la manipulación espacial (sf), conexión a bases de datos (RPostgres), microsimulación (rakeR) y visualización (ggplot2).
+
+```{r}
+library(rakeR)       # Microsimulación
+library(RPostgres)   # Conexión BD
+library(DBI)         # Manejo BD
+library(sf)          # Mapas
+library(dplyr)       # Datos
+library(tidyr)       # Transformación de datos (para boxplots)
+library(ggplot2)     # Gráficos
+library(factoextra)  # Clusters
+library(cluster)     # K-Means
+library(stringr)     # Texto
+
+# Semilla para resultados replicables
+set.seed(123)
+
+# Tema Gráfico Unificado
+tema_pro = theme_minimal() +
+  theme(
+    plot.title = element_text(face="bold", size=14, hjust=0.5),
+    plot.subtitle = element_text(size=10, color="grey40", hjust=0.5),
+    panel.grid.major = element_line(color="grey90", linetype="dashed"),
+    legend.position = "bottom"
+  )
+
+```
+
+## **3.2. Ejecución de la Microsimulación (Raking)**
+
+Se carga la CASEN y el Censo. Se limpian y recodifican las variables (Edad, Sexo, Escolaridad) para hacerlas compatibles con los datos marginales del Censo. La variable objetivo es el Analfabetismo.
+
+```{r}
+# 1.1 Carga (RUTAS CORREGIDAS PARA R MARKDOWN)
+
+# Intenta retroceder dos niveles para encontrar la carpeta 'data'
+# Si tu archivo está en "trabajos/t3", esto debería funcionar:
+ruta_casen = "../../data/casen_rm.rds"
+ruta_censo = "../../data/cons_censo_df.rds"
+
+# --- DIAGNÓSTICO DE EMERGENCIA (Solo para verificar) ---
+if(!file.exists(ruta_casen)) {
+  # Si falla, intentamos con un solo nivel atrás (por si está en "trabajos/")
+  ruta_casen = "../data/casen_rm.rds"
+  ruta_censo = "../data/cons_censo_df.rds"
+}
+
+if(!file.exists(ruta_casen)) {
+  # Si falla de nuevo, asumimos que 'data' está en la misma carpeta
+  ruta_casen = "data/casen_rm.rds"
+  ruta_censo = "data/cons_censo_df.rds"
+}
+
+# Finalmente cargamos
+casen = readRDS(ruta_casen)
+cons_censo_df = readRDS(ruta_censo)
+
+# 1.2 Pre-procesamiento
+col_cons = sort(setdiff(names(cons_censo_df), c("GEOCODIGO", "COMUNA")))
+age_levels = grep("^edad", col_cons, value = TRUE)
+esc_levels = grep("^esco", col_cons, value = TRUE)
+sexo_levels = grep("^sexo", col_cons, value = TRUE)
+
+# Selección y Limpieza CASEN
+casen = casen[, c("estrato", "esc", "edad", "sexo", "e6a", "e1")]
+casen$Comuna = substr(as.character(casen$estrato), 1, 5)
+casen$estrato = NULL
+casen$esc = as.integer(unclass(casen$esc))
+casen$edad = as.integer(unclass(casen$edad))
+casen$e6a = as.numeric(unclass(casen$e6a))
+casen$sexo = as.integer(unclass(casen$sexo))
+casen$e1 = as.numeric(unclass(casen$e1))
+
+# Variable Analfabetismo
+casen$no_lee_escribe = ifelse(is.na(casen$e1), 0, ifelse(casen$e1 == 1, 0, 1))
+casen$e1 = NULL
+
+# Imputación Escolaridad
+idx_na = which(is.na(casen$esc))
+fit = lm(esc ~ e6a, data = casen[-idx_na,])
+pred = predict(fit, newdata = casen[idx_na, ,drop = FALSE])
+casen$esc[idx_na] = as.integer(round(pmax(0, pmin(29, pred))))
+casen$ID = as.character(seq_len(nrow(casen)))
+
+# Recodificación
+casen$edad_cat = cut(casen$edad, breaks = c(0,30,40,50,60,70,80,Inf), labels = age_levels, right = FALSE, include.lowest = TRUE)
+casen$esc_cat = factor(with(casen, ifelse(esc == 0, esc_levels[1], ifelse(esc <= 8, esc_levels[2], ifelse(esc <= 12, esc_levels[3], esc_levels[4])))), levels = esc_levels)
+casen$sexo_cat = factor(ifelse(casen$sexo == 2, sexo_levels[1], ifelse(casen$sexo == 1, sexo_levels[2], NA)), levels = sexo_levels)
+
+# Algoritmo rakeR
+cons_censo_comunas = split(cons_censo_df, cons_censo_df$COMUNA)
+inds_list = split(casen, casen$Comuna)
+comunas_comunes = intersect(names(cons_censo_comunas), names(inds_list))
+
+sim_list = lapply(comunas_comunes, function(zona) {
+  cons_i = cons_censo_comunas[[zona]]
+  col_order = sort(setdiff(names(cons_i), c("COMUNA","GEOCODIGO")))
+  cons_i = cons_i[, c("GEOCODIGO", col_order), drop = FALSE]
+  tmp = inds_list[[zona]]
+  inds_i = tmp[, c("ID","edad_cat","esc_cat","sexo_cat"), drop = FALSE]
+  names(inds_i) = c("ID","Edad","Escolaridad","Sexo")
+  w_frac = weight(cons = cons_i, inds = inds_i, vars = c("Edad","Escolaridad","Sexo"))
+  sim_i  = integerise(weights = w_frac, inds = inds_i, seed = 123)
+  merge(sim_i, tmp[, c("ID","no_lee_escribe")], by = "ID", all.x = TRUE)
+})
+sim_df = data.table::rbindlist(sim_list, idcol = "COMUNA")
+
+
+## -----------------------------------------------------------------------------
+## 2. CÁLCULO DE TASAS (AGREGACIÓN)
+## -----------------------------------------------------------------------------
+message("--- (2/8) CALCULANDO TASAS POR ZONA ---")
+df_tasas = sim_df %>%
+  group_by(zone) %>%
+  summarise(n_total = n(), n_no_lee = sum(no_lee_escribe, na.rm = TRUE)) %>%
+  mutate(tasa_analfabetismo = n_no_lee / n_total)
+df_tasas$zone = trimws(as.character(df_tasas$zone))
+
+
+```
+
+## **3.3. Integración de Datos Espaciales y Censales**
+
+A continuación, se descargan las geometrías y variables adicionales (Migración y Rezago Escolar) directamente desde la base de datos PostgreSQL/PostGIS. Se filtra el área de estudio exclusivamente al Gran Santiago (34 comunas).
+
+```{r}
+con = dbConnect(RPostgres::Postgres(), dbname="censo_rm_2017", host="localhost", port=5432, user="postgres", password="postgres")
+
+# Geometría
+query_geo = "SELECT geocodigo, geom FROM dpa.zonas_censales_rm"
+zonas_sf = st_read(con, query = query_geo, quiet = TRUE)
+zonas_sf$geocodigo = trimws(as.character(zonas_sf$geocodigo))
+
+# Datos Reales (Migración/Educación)
+sql_indicadores = "
+SELECT z.geocodigo, c.nom_comuna,
+  ROUND(COUNT(*) FILTER (WHERE p.p12 NOT IN (1, 2, 98, 99)) * 100.0 / NULLIF(COUNT(*), 0), 2) AS ptje_migrantes,
+  ROUND(COUNT(*) FILTER (WHERE p.p13 = 3) * 100.0 / NULLIF(COUNT(*) FILTER (WHERE p.p13 IN (1, 2, 3)), 0), 2) AS ptje_nunca_asistio
+FROM public.personas p
+JOIN public.hogares h ON p.hogar_ref_id = h.hogar_ref_id
+JOIN public.viviendas v ON h.vivienda_ref_id = v.vivienda_ref_id
+JOIN public.zonas z ON v.zonaloc_ref_id = z.zonaloc_ref_id
+JOIN public.comunas c ON z.codigo_comuna = c.codigo_comuna
+GROUP BY z.geocodigo, c.nom_comuna;"
+df_censo_real = dbGetQuery(con, sql_indicadores)
+df_censo_real$geocodigo = trimws(as.character(df_censo_real$geocodigo))
+
+# Filtro Gran Santiago y Unión Final
+comunas_gs = c("SANTIAGO", "CERRILLOS", "CERRO NAVIA", "CONCHALI", "EL BOSQUE", "ESTACION CENTRAL", "HUECHURABA", "INDEPENDENCIA", "LA CISTERNA", "LA FLORIDA", "LA GRANJA", "LA PINTANA", "LA REINA", "LAS CONDES", "LO BARNECHEA", "LO ESPEJO", "LO PRADO", "MACUL", "MAIPU", "ÑUÑOA", "PEDRO AGUIRRE CERDA", "PEÑALOLEN", "PROVIDENCIA", "PUDAHUEL", "QUILICURA", "QUINTA NORMAL", "RECOLETA", "RENCA", "SAN JOAQUIN", "SAN MIGUEL", "SAN RAMON", "VITACURA", "PUENTE ALTO", "SAN BERNARDO")
+
+sf_master = zonas_sf %>%
+  dplyr::inner_join(df_censo_real, by = "geocodigo") %>%
+  dplyr::inner_join(df_tasas, by = c("geocodigo" = "zone")) %>%
+  filter(trimws(nom_comuna) %in% comunas_gs) %>%
+  na.omit()
+
+# Bordes para mapas
+sf_bordes = sf_master %>% group_by(nom_comuna) %>% summarise()
+```
+
+4.  **Análisis de Resultados**
+
+**4.1. Distribución del Analfabetismo (Microsimulación)**
+
+El primer resultado relevante es la espacialización de la tasa de analfabetismo. Al ser una variable rara en entornos urbanos, su concentración indica focos de alta vulnerabilidad social.
+
+```{r}
+mapa_1 = ggplot() +
+  geom_sf(data=sf_master, aes(fill=tasa_analfabetismo), lwd=0, color=NA) +
+  geom_sf(data=sf_bordes, fill=NA, color="white", lwd=0.3) +
+  geom_sf_text(data=sf_bordes, aes(label=nom_comuna), size=2.5, color="white", fontface="bold", check_overlap=TRUE) +
+  scale_fill_viridis_c(option="magma", direction=-1, labels=scales::percent, name="Tasa") +
+  labs(title="1. Tasa de Analfabetismo Estimada", subtitle="Gran Santiago (Estimación Microsimulada)") + 
+  tema_pro
+print(mapa_1)
+```
+
+Este mapa constituye la base empírica para todo el análisis de segregación en el Gran Santiago, confirmando el patrón histórico centro-periferia, pero ahora a nivel de zona censal gracias a la microsimulación. La distribución es extremadamente heterogénea, con las tasas más bajas (colores claros, cerca del 0% al 2%) concentradas en el cono de baja vulnerabilidad del sector nororiente (Vitacura, Las Condes, Lo Barnechea, y Providencia), lo cual es coherente con el perfil de alta renta y alta concentración de capital humano. Por otro lado, los focos de vulnerabilidad crítica (tonos morados/negros, $6\%$ al $8\%$ o más) se localizan en la periferia sur (La Pintana, El Bosque, San Bernardo) y poniente (Cerro Navia, Pudahuel), zonas históricamente asociadas a la exclusión social y el rezago educativo. El contraste entre estos dos extremos define la principal fractura socioespacial que el análisis de clústeres buscará tipificar, mientras que las zonas centrales (como Santiago y Ñuñoa) muestran colores intermedios, indicando una mayor mezcla de población, un factor clave para el posterior análisis de Entropía de Shannon.
+
+## **4.2. Tipificación Socioeconómica (Clustering)**
+
+### **4.2.1. Análisis perfil de clusters y metodo del codo.**
+
+El análisis estadístico justifica la separación de los $k=4$ grupos, demostrando que tienen distribuciones significativamente distintas en las tres variables utilizadas (Analfabetismo, Migración, Rezago Escolar).
+
+```{r}
+# Datos numéricos
+datos_cluster = sf_master %>% st_drop_geometry() %>% select(tasa_analfabetismo, ptje_migrantes, ptje_nunca_asistio)
+datos_scaled  = scale(datos_cluster)
+
+# Método del Codo
+print(fviz_nbclust(datos_scaled, kmeans, method="wss") + labs(title="Método del Codo"))
+# [Image of elbow method graph]
+```
+
+Se seleccionó k=4 como el número óptimo de grupos. A continuación, caracterizamos estadísticamente cada grupo para asignarles etiquetas automáticas basadas en sus promedios.
+
+```{r}
+# Ejecución K-Means
+set.seed(123)
+km = kmeans(datos_scaled, centers=4, nstart=25)
+sf_master$cluster = as.factor(km$cluster)
+
+# Perfilamiento Estadístico
+g_analf = mean(sf_master$tasa_analfabetismo); sd_analf = sd(sf_master$tasa_analfabetismo)
+g_migra = mean(sf_master$ptje_migrantes);     sd_migra = sd(sf_master$ptje_migrantes)
+g_educ  = mean(sf_master$ptje_nunca_asistio); sd_educ  = sd(sf_master$ptje_nunca_asistio)
+
+perfiles = sf_master %>% st_drop_geometry() %>% group_by(cluster) %>%
+  summarise(m_analf=mean(tasa_analfabetismo), m_migra=mean(ptje_migrantes), m_educ=mean(ptje_nunca_asistio)) %>%
+  mutate(
+    txt_migra = case_when(m_migra > g_migra + sd_migra ~ "Migr. MUY ALTA", m_migra > g_migra ~ "Migr. Alta", TRUE ~ "Migr. Baja"),
+    txt_analf = case_when(m_analf > g_analf + sd_analf ~ "Analf. CRÍTICO", m_analf > g_analf ~ "Analf. Alto", TRUE ~ "Analf. Bajo"),
+    txt_educ  = case_when(m_educ > g_educ + sd_educ ~ "(Rezago Escolar)", TRUE ~ "")
+  ) %>%
+  mutate(label_final = paste0("C", cluster, ": ", txt_migra, " / ", txt_analf, " ", txt_educ))
+
+sf_master = left_join(sf_master, perfiles, by="cluster")
+
+# Mostrar Tabla Resumen
+knitr::kable(perfiles %>% select(cluster, m_migra, m_analf, label_final), digits=3, caption="Perfiles Estadísticos de los Clústeres")
+
+# 6.1 Tabla Resumen (Promedios Reales)
+resumen_stats = sf_master %>%
+  st_drop_geometry() %>%
+  group_by(cluster) %>%
+  summarise(
+    Zonas = n(),
+    `Media Analfabetismo` = round(mean(tasa_analfabetismo)*100, 2), # En porcentaje
+    `Media Migración (%)` = round(mean(ptje_migrantes), 2),
+    `Media Rezago Educ (%)` = round(mean(ptje_nunca_asistio), 2)
+  )
+print("--- TABLA DE PROMEDIOS POR CLUSTER ---")
+print(resumen_stats)
+
+# 6.2 Boxplots (Evidencia Visual)
+# Transformamos a formato largo para graficar todo junto
+datos_largos = sf_master %>%
+  st_drop_geometry() %>%
+  select(cluster, tasa_analfabetismo, ptje_migrantes, ptje_nunca_asistio) %>%
+  pivot_longer(cols = -cluster, names_to = "Variable", values_to = "Valor")
+
+boxplots = ggplot(datos_largos, aes(x=cluster, y=Valor, fill=cluster)) +
+  geom_boxplot(alpha=0.7, outlier.size=0.5) +
+  facet_wrap(~Variable, scales="free_y", labeller = labeller(Variable = c(
+    tasa_analfabetismo = "Tasa Analfabetismo (0-1)",
+    ptje_migrantes = "% Migrantes (0-100)",
+    ptje_nunca_asistio = "% Nunca Asistió (0-100)"
+  ))) +
+  scale_fill_brewer(palette="Set1") +
+  labs(title="Distribución de Variables por Clúster", 
+       subtitle="Evidencia estadística para la caracterización de grupos") +
+  tema_pro
+print(boxplots)
+
+# Gráfico de Dispersión
+plot_dispersim = ggplot(sf_master, aes(x = ptje_migrantes, y = tasa_analfabetismo, color = cluster)) +
+  geom_point(alpha = 0.6, size = 2) + stat_ellipse(aes(fill = cluster), geom = "polygon", alpha = 0.2) +
+  labs(title = "Dispersión: Migración vs Analfabetismo", x = "% Migrantes (Censo)", y = "Tasa Analfabetismo (Simulado)") + tema_pro
+print(plot_dispersim)
+
+# Gráfico PCA
+plot_pca = fviz_cluster(km, data = datos_scaled, palette = "Set2", geom = "point", 
+                        ellipse.type = "convex", ggtheme = theme_minimal(), main = "Clusters PCA")
+print(plot_pca)
+```
+
+Los gráficos de dispersión y las tablas de promedios confirman que el método K-Means ha segmentado las zonas censales en cuatro perfiles significativamente distintos, principalmente a lo largo de los ejes de vulnerabilidad (analfabetismo/rezago) y migración.
+
+### 4.2.2 Análisis Estadístico de los Perfiles
+
+La tabla de promedios (Tabla de Promedios por Clúster) y los gráficos de caja (Distribución de Variables por Clúster) proporcionan la evidencia numérica para la caracterización de cada grupo:
+
+|  |  |  |  |  |
+|---------------|---------------|---------------|---------------|---------------|
+| **Clúster** | **Perfil Socioeconómico** | **Media Analfabetismo (%)** | **Media Migración (%)** | **Justificación** |
+| **C4** | **Migr. MUY ALTA / Analf. Bajo** | $0.76$ | $31.31$ | Grupo de **Alta Concentración Migrante**, con la tasa más baja de analfabetismo, indicando una población joven y activa. Claramente separado en el Scatter Plot (púrpura, eje X extremo). |
+| **C1** | **Migr. Baja / Analf. CRÍTICO** | $3.48$ | $4.40$ | Grupo con **Máxima Vulnerabilidad Educativa Simulada**. Presenta la media de analfabetismo más alta ($3.48\%$) y el mayor rezago escolar, sugiriendo población adulta mayor o con exclusión educativa histórica. |
+| **C3** | **Migr. Baja / Analf. Alto (Rezago Escolar)** | $2.77$ | $3.60$ | **Alto Rezago Educativo**. Este grupo es el que presenta la media más alta de **% Nunca Asistió** (5.72%), un indicador de fuerte exclusión estructural, similar al C1 pero con menor intensidad de analfabetismo directo. |
+| **C2** | **Migr. Baja / Analf. Bajo** | $1.36$ | $6.92$ | **Baja Vulnerabilidad**. Grupo de menor analfabetismo y rezago escolar, con una migración ligeramente superior al C1/C3. Corresponde a las zonas de población de clase media y alta. |
+
+### 4.2.3 Composición Detallada de los Clústeres
+
+**1. C4: Migración MUY ALTA / Analf. Bajo (Púrpura)**
+
+-   **Composición:** Representa las **zonas de recepción de migración** en el Gran Santiago (Santiago Centro, Estación Central, Independencia).
+
+-   **Características:** Es el clúster con la media de migración más alta ($31.31\%$). Su baja tasa de analfabetismo ($0.76\%$) refleja que la población migrante es generalmente más joven y activa, y no está afectada por los rezagos educativos estructurales.
+
+-   **Visualización:** Este grupo es el más disperso en el eje X (Migración) del Scatter Plot y está claramente segregado en el gráfico PCA (Dim1 positiva, Dim2 positiva).
+
+**2. C1: Migración Baja / Analf. CRÍTICO (Rojo)**
+
+-   **Composición:** Zonas con mayor **exclusión socio-educativa**.
+
+-   **Características:** Posee la **media de analfabetismo más alta** ($3.48\%$) y una alta concentración de rezago escolar. Este grupo domina las zonas más vulnerables de la periferia tradicional.
+
+-   **Visualización:** En el Scatter Plot, este clúster ocupa el rango superior en el eje Y (analfabetismo), con baja migración, lo que lo define como el perfil de máxima vulnerabilidad.
+
+**3. C3: Migración Baja / Analf. Alto (Rezago Escolar) (Verde Oscuro)**
+
+-   **Composición:** Zonas de vulnerabilidad intermedia o con **fuerte rezago educativo** entre la población adulta.
+
+-   **Características:** Su rasgo distintivo es el **alto porcentaje de población que nunca asistió al colegio** ($5.72\%$), lo que justifica la etiqueta "(Rezago Escolar)". Es un perfil de vulnerabilidad estructural tradicional, pero menos extrema en la tasa de analfabetismo que el C1.
+
+-   **Visualización:** En el Scatter Plot, se superpone con C1 y C2 en el eje X, pero está ligeramente más disperso y su distribución en el Boxplot de Rezago Escolar es alta.
+
+**4. C2: Migración Baja / Analf. Bajo (Verde Claro/Cian)**
+
+-   **Composición:** Clúster de **referencia** o **clase media/alta**.
+
+-   **Características:** Presenta las tasas de analfabetismo más bajas ($1.36\%$) y bajos niveles en las demás variables de vulnerabilidad.
+
+-   **Visualización:** Este grupo domina gran parte de las comunas de clase media y se mezcla con el C4 en el centro, ocupando la región de la dispersión con bajo analfabetismo.
+
+### **4.2.4 Visualización Espacial de los Clústeres**
+
+```{r}
+## -----------------------------------------------------------------------------
+## 7. MAPA 2: CLUSTERS PERFILADOS (CORREGIDO)
+## -----------------------------------------------------------------------------
+message("--- (7/8) GENERANDO MAPA DE CLUSTERS ---")
+
+# 1. Recalcular estadísticas globales (por seguridad)
+g_analf = mean(sf_master$tasa_analfabetismo, na.rm = TRUE)
+sd_analf = sd(sf_master$tasa_analfabetismo, na.rm = TRUE)
+g_migra = mean(sf_master$ptje_migrantes, na.rm = TRUE)
+sd_migra = sd(sf_master$ptje_migrantes, na.rm = TRUE)
+g_educ  = mean(sf_master$ptje_nunca_asistio, na.rm = TRUE)
+sd_educ = sd(sf_master$ptje_nunca_asistio, na.rm = TRUE)
+
+# 2. Crear Perfiles (asegurando que sf_master tenga la columna 'cluster')
+perfiles = sf_master %>% 
+  st_drop_geometry() %>% 
+  group_by(cluster) %>%
+  summarise(
+    m_analf = mean(tasa_analfabetismo, na.rm = TRUE), 
+    m_migra = mean(ptje_migrantes, na.rm = TRUE), 
+    m_educ = mean(ptje_nunca_asistio, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    txt_migra = case_when(
+      m_migra > g_migra + sd_migra ~ "Migr. MUY ALTA", 
+      m_migra > g_migra            ~ "Migr. Alta", 
+      TRUE                         ~ "Migr. Baja"
+    ),
+    txt_analf = case_when(
+      m_analf > g_analf + sd_analf ~ "Analf. CRÍTICO", 
+      m_analf > g_analf            ~ "Analf. Alto", 
+      TRUE                         ~ "Analf. Bajo"
+    ),
+    txt_educ = case_when(
+      m_educ > g_educ + sd_educ ~ "(Rezago Esc.)", 
+      TRUE                      ~ ""
+    )
+  ) %>%
+  mutate(label_final = paste0("C", cluster, ": ", txt_migra, " / ", txt_analf, " ", txt_educ))
+
+# 3. Unir los perfiles al mapa maestro
+# Eliminamos label_final anterior si existe para evitar duplicados (.x .y)
+if("label_final" %in% names(sf_master)) sf_master$label_final <- NULL
+
+sf_master = left_join(sf_master, perfiles[, c("cluster", "label_final")], by = "cluster")
+
+# 4. Graficar (Usando geom_sf_label para el fondo blanco legalmente)
+mapa_2 = ggplot() +
+  # Capa de clusters
+  geom_sf(data = sf_master, aes(fill = label_final), lwd = 0, color = NA) +
+  
+  # Capa de bordes comunales (Solo contorno)
+  geom_sf(data = sf_bordes, fill = NA, color = "white", lwd = 0.3) +
+  
+  # Etiquetas (Usamos geom_sf_label para tener fondo blanco automáticamente)
+  geom_sf_label(data = sf_bordes, aes(label = nom_comuna), 
+                size = 2, color = "black", fontface = "bold", 
+                fill = "white", alpha = 0.7, label.size = 0) + 
+  
+  scale_fill_brewer(palette = "Set1", name = "Perfil") +
+  labs(
+    title = "2. Clusters Socioeconómicos", 
+    subtitle = "K-Means (k=4) - Perfiles generados automáticamente",
+    caption = "Fuente: Censo 2017 + Microsimulación CASEN"
+  ) +
+  tema_pro
+
+print(mapa_2)
+```
+
+El mapa de clusters socioeconómicos evidencia una estructura territorial altamente polarizada en el Gran Santiago. El **Clúster C1 (Migración Baja / Analfabetismo Crítico)** se concentra en la periferia sur y sur-poniente —especialmente en La Pintana, El Bosque, San Bernardo y Cerro Navia— configurando áreas de vulnerabilidad educativa estructural con rezagos persistentes. El **Clúster C2 (Migración Baja / Analfabetismo Bajo)** aparece disperso en comunas intermedias como Maipú, La Florida, Macul y Huechuraba, representando perfiles de transición asociados a sectores medios con mejores indicadores educativos. El **Clúster C3 (Migración Baja / Analfabetismo Alto con Rezago Escolar)** forma bolsillos específicos en comunas como La Granja, Pedro Aguirre Cerda y Lo Espejo, reforzando la existencia de focos localizados de rezago escolar profundo dentro de zonas vulnerables. En contraste, el **Clúster C4 (Migración Muy Alta / Analfabetismo Bajo)** se concentra en Santiago Centro, Independencia y Recoleta, reflejando la dinámica migratoria contemporánea, pero también aparece en Lo Barnechea, mostrando que la presencia migrante puede coexistir con altos niveles socioeconómicos. En conjunto, el patrón espacial revela una ciudad fragmentada: la periferia concentra vulnerabilidad educativa (C1 y C3), el centro funciona como espacio de mezcla social impulsado por la migración (C4), y el eje nororiente mantiene una fuerte homogeneidad de altos ingresos (C2 y C4). Este mapa confirma que la segregación en Santiago no solo se expresa en desigualdades, sino también en la clara separación territorial de perfiles socioeducativos.
+
+**4.3. Heterogeneidad Comunal (Índice de Shannon)**
+
+Finalmente, ¿qué comunas son socialmente más diversas? Calculamos la entropía de Shannon basándonos en la diversidad de clústeres presentes en cada comuna.
+
+```{r}
+message("--- (8/8) GENERANDO MAPA DE SHANNON ---")
+
+df_shannon = sf_master %>% st_drop_geometry() %>%
+  group_by(nom_comuna, cluster) %>% summarise(n=n(), .groups='drop') %>%
+  group_by(nom_comuna) %>% mutate(prop=n/sum(n)) %>%
+  summarise(indice_shannon = -sum(prop * log(prop))) %>% ungroup()
+
+sf_shannon = sf_bordes %>% left_join(df_shannon, by="nom_comuna")
+
+mapa_3 = ggplot() +
+  geom_sf(data=sf_shannon, aes(fill=indice_shannon), color="white", lwd=0.5) +
+  geom_sf_text(data=sf_shannon, aes(label=nom_comuna), size=2.5, color="black", check_overlap=TRUE) +
+  scale_fill_viridis_c(option="plasma", name="Índice H") +
+  labs(title="3. Variabilidad Intra-Comunal", subtitle="Claro = Heterogéneo | Oscuro = Segregado") + tema_pro
+print(mapa_3)
+
+message("--- PROCESO FINALIZADO ---")
+```
+
+El mapa de variabilidad intra-comunal, basado en el **Índice de Entropía de Shannon**, revela diferencias sustantivas en los niveles de heterogeneidad interna de las comunas del Gran Santiago. Las tonalidades más claras —observadas principalmente en **Santiago, Ñuñoa, Providencia, Recoleta, Independencia y Macul**— indican valores altos de entropía (H ≈ 0.8–1.2), lo que refleja una mayor mezcla interna de perfiles socioeconómicos, coherente con su rol como zonas de transición y con la fuerte presencia de población migrante y sectores medios. En contraste, las tonalidades más oscuras —presentes en **Vitacura, Lo Barnechea, La Pintana, El Bosque y San Bernardo**— exhiben valores bajos de entropía (H \< 0.4), evidenciando homogeneidad interna y altos niveles de segregación, tanto en comunas de altos ingresos como en comunas con vulnerabilidad estructural. Este patrón confirma que la segregación en Santiago se expresa no solo entre comunas, sino también en la consistencia interna de cada una: mientras el centro muestra coexistencia de múltiples perfiles sociales, los extremos socioeconómicos mantienen estructuras internas altamente uniformes, reforzando la polarización territorial de la ciudad.
+
+# **5. Conclusión**
+
+El análisis desarrollado demuestra que la articulación metodológica entre Microsimulación Espacial (rakeR), Clustering K-Means y Entropía de Shannon constituye un enfoque robusto para caracterizar y cuantificar la segregación socioespacial en el Gran Santiago. Esta secuencia analítica permitió avanzar desde una variable base (analfabetismo) hacia una tipología multivariante y, finalmente, hacia una medida formal de heterogeneidad territorial.
+
+## **5.1. Aportes de la Microsimulación y del Clustering**
+
+La microsimulación permitió construir una distribución espacial refinada de la Tasa de Analfabetismo, identificando de manera preliminar zonas críticas de vulnerabilidad educativa. Sobre esta base, la aplicación del clustering fue decisiva para transformar un único indicador en una estructura de perfiles socioeducativos, capturando patrones que no son observables a simple vista.
+
+Los cuatro clústeres obtenidos revelaron:
+
+-   **Persistencia del analfabetismo estructural:** Los clústeres C1 y C3 concentraron simultáneamente altas tasas de analfabetismo y mayor rezago escolar, validando la existencia de un corredor de exclusión educativa en la periferia Sur y Poniente (La Pintana, El Bosque, Cerro Navia).
+
+-   **Diferenciación del fenómeno migrante:** El clúster C4 identificó zonas de muy alta presencia migrante pero bajo analfabetismo, principalmente en Santiago Centro e Independencia, evidenciando una dinámica socioespacial distinta a la vulnerabilidad histórica.
+
+## **5.2. Segregación y Mezcla Interna: Resultados del Índice de Shannon**
+
+La Entropía de Shannon, aplicada a la distribución de clústeres dentro de cada comuna, permitió formalizar la magnitud de la segregación. Los resultados revelan una división nítida entre:
+
+-   **Comunas homogéneas y altamente segregadas:** Aquellas situadas en los extremos de la estructura social (altamente vulnerables o altamente acomodadas) presentan valores de entropía muy bajos (H ≈ 0.0–0.3), indicando ausencia de mezcla interna. Ejemplos claros son **Vitacura, Lo Barnechea y La Pintana**.
+
+-   **Comunas heterogéneas y de transición**: Sectores centrales como Santiago, Ñuñoa, Macul y Providencia exhiben los mayores valores de entropía (H ≈ 1.0–1.2), reflejando una coexistencia real de perfiles migrantes (C4), medios (C2) y altos. Estos territorios constituyen los principales espacios de mezcla social efectiva en la ciudad.
+
+En conjunto, los resultados obtenidos demuestran que la segregación del Gran Santiago no solo se expresa en la distribución desigual de las condiciones socioeducativas entre comunas, sino también en la estructura interna de cada territorio. Mientras la periferia vulnerable y el eje nororiente reproducen perfiles altamente homogéneos ya sea por acumulación histórica de desventajas o por concentración de altos ingresos, el área central emerge como el único espacio donde distintos grupos sociales coexisten en proximidad territorial. Este hallazgo confirma que la heterogeneidad urbana no se distribuye de manera aleatoria, sino que responde a lógicas estructurales de localización, mercado del suelo y trayectorias residenciales diferenciadas.
+
+Finalmente, la integración de microsimulación, clustering y entropía demuestra su eficacia para capturar con precisión las dimensiones ocultas de la desigualdad urbana. El estudio no solo permite identificar patrones, sino también cuantificar la intensidad de la segregación y sus formas de manifestación a distintas escalas. En este sentido, el enfoque aplicado constituye una herramienta replicable para el monitoreo territorial y para la formulación de políticas públicas orientadas a mitigar la fragmentación socioespacial de la ciudad.
