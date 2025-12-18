@@ -1,0 +1,279 @@
+---
+title: "tarea_2_nadinic"
+author: "Matías Nadinic Bravo"
+date: "2025-12-11"
+output: html_document
+---
+
+```{r}
+# Carga de librerías para procesamiento y modelamiento
+library(haven)    # Lectura de formatos .dta/.rds
+library(dplyr)    # Manipulación de datos (Gramática de datos)
+library(pROC)     # Evaluación de modelos de clasificación (Curva ROC)
+library(ggplot2)  # Visualización avanzada
+library(scales)   # Formato de ejes (moneda)
+```
+
+# 1. Introducción y Objetivos
+
+El presente informe tiene como objetivo la estimación del gasto potencial de los hogares en **Gasolina**, utilizando un enfoque econométrico de microsimulación. Este ejercicio se enmarca en la necesidad de generar variables imputadas de gasto a nivel territorial para análisis de Geomarketing.
+
+Para lograr esto, se implementa un **Modelo de Dos Partes (Two-Part Model)**. Este enfoque es superior a una regresión lineal simple cuando se trabaja con bienes que no son consumidos por toda la población (censura en cero), permitiendo modelar por separado la *decisión de consumo* y la *intensidad del consumo*.
+
+# 2. Selección del Servicio y Datos
+
+## 2.1 Justificación del Servicio
+
+Se ha seleccionado el ítem **Gasolina (CCIF 07.2.2.02.01)**.
+
+-   **Relevancia Territorial:** El gasto en combustible es un proxy directo de la movilidad privada y la tenencia de activos (automóvil), variables que presentan una fuerte segregación espacial en la ciudad.
+
+-   **Geolocalización:** Al imputar este gasto en la CASEN, es posible mapear zonas de alta demanda de transporte privado vs. zonas dependientes del transporte público.
+
+-   **Idoneidad del Modelo:** Dado que no todos los hogares tienen automóvil, la variable presenta una gran cantidad de "ceros estructurales", lo que hace indispensable el uso de un modelo de dos etapas (Logit + OLS) en lugar de una regresión simple.
+
+## 2.2 Fuentes de Datos
+
+-   **Encuesta de Presupuestos Familiares (EPF):** Fuente de entrenamiento ("Ground Truth"). Contiene el gasto real detallado.
+
+-   **Encuesta CASEN 2022:** Fuente de destino. No contiene gastos detallados, pero sí las características sociodemográficas necesarias para la imputación masiva.
+
+# 3. Procesamiento de Datos (EPF)
+
+El primer desafío es construir la variable dependiente e independientes desde la EPF, asegurando que la unidad de análisis sea el **Hogar** y no el individuo, ya que el combustible es un gasto compartido.
+
+```{r}
+
+# 1. Carga de datos originales (Ajustar rutas locales)
+personas_epf   <- read_dta("data/datos_epf/base-personas-ix-epf-stata.dta")
+gastos_epf     <- read_dta("data/datos_epf/base-gastos-ix-epf-stata.dta")
+cantidades_epf <- read_dta("data/datos_epf/base-cantidades-ix-epf-stata.dta")
+ccif_epf       <- read_dta("data/datos_epf/ccif-ix-epf-stata.dta")
+
+# 2. Construcción de Variable Dependiente (Gasto Agregado)
+# Se suman todos los registros de compra de gasolina dentro del mes para el hogar.
+gasto_gasolina <- gastos_epf %>%
+  filter(ccif == "07.2.2.02.01") %>%
+  group_by(folio) %>%
+  summarise(gasto_mensual = sum(gasto, na.rm = TRUE)) 
+
+# 3. Selección de Variables Explicativas
+# Se utiliza al Jefe de Hogar como representante de las características socioeconómicas.
+hogares_epf <- personas_epf %>%
+  filter(if("pco1" %in% names(.)) pco1 == 1 else n_linea == 1) %>% 
+  filter(macrozona == 2) %>%  # Filtro: Gran Santiago (para homogeneidad urbana)
+  select(folio, ing_disp_hog_hd_ai, npersonas, edue)
+```
+
+## 3.1 Construcción de la Tabla Maestra (Master Table)
+
+En esta etapa se unen las bases y se realizan transformaciones matemáticas críticas para el modelo.
+
+-   **Transformación Logarítmica (`log_ingreso`):** Se aplica logaritmo al ingreso per cápita. *Justificación:* La distribución del ingreso es altamente sesgada a la derecha. El logaritmo "normaliza" la variable, permitiendo que la regresión lineal capture mejor la elasticidad ingreso-gasto.
+
+-   **Variable Binaria (`d_gasto`):** Se crea una variable dummy (1/0) para separar a quienes consumen de quienes no.
+
+    ```{r}
+    base_modelo <- left_join(hogares_epf, gasto_gasolina, by = "folio") %>%
+      mutate(
+        # Imputación de ceros para hogares sin registro de compra
+        gasto_mensual = ifelse(is.na(gasto_mensual), 0, gasto_mensual),
+        
+        # Variable Dependiente 1: Decisión de Compra (Binaria)
+        d_gasto = ifelse(gasto_mensual > 0, 1, 0),
+        
+        # Variables Explicativas
+        ingreso_pc = ing_disp_hog_hd_ai / npersonas,
+        log_ingreso = log(ingreso_pc + 1), # +1 para evitar log(0)
+        
+        # Categorización Educacional (Simplificación para robustez)
+        educacion_niv = case_when(
+          edue <= 12 ~ "Basica_Media",
+          edue > 12 ~ "Superior",
+          TRUE ~ "Otro"
+        )
+      ) %>%
+      filter(ing_disp_hog_hd_ai > 0) # Limpieza de datos erróneos
+    ```
+
+# 4. Análisis Exploratorio
+
+Antes de calibrar el modelo, es imperativo visualizar las relaciones subyacentes en los datos para validar nuestras hipótesis económicas.
+
+```{r}
+# Filtramos solo gastos positivos para analizar el monto
+datos_graficos <- base_modelo %>% filter(gasto_mensual > 0)
+
+# Gráfico A: Relación Ingreso vs Probabilidad (Justificación del Logit)
+g1 <- ggplot(base_modelo, aes(x = log_ingreso, y = d_gasto)) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "forestgreen") +
+  labs(title = "Probabilidad de Tener Auto/Gasto",
+       subtitle = "Curva Sigmoide (S-Shape)",
+       x = "Logaritmo del Ingreso", y = "Probabilidad") +
+  theme_minimal()
+
+# Gráfico B: Relación Ingreso vs Monto (Justificación del OLS)
+g2 <- ggplot(datos_graficos, aes(x = ingreso_pc, y = gasto_mensual)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Elasticidad Gasto-Ingreso",
+       x = "Ingreso Per Cápita", y = "Gasto Mensual ($)") +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_x_continuous(labels = dollar_format()) +
+  theme_minimal()
+
+# Gráfico C: Distribución del Gasto según Educación (Boxplot)
+g3 <- ggplot(datos_graficos, aes(x = educacion_niv, y = gasto_mensual, fill = educacion_niv)) +
+  geom_boxplot() +
+  labs(title = "Distribución del Gasto según Nivel Educacional",
+       x = "Educación Jefe Hogar", y = "Gasto Mensual") +
+  scale_y_continuous(labels = dollar_format()) +
+  theme_minimal() + theme(legend.position = "none")
+
+# Gráfico D: Distribución del Gasto según Tamaño del Hogar (Boxplot)
+g4 <- ggplot(datos_graficos, aes(x = factor(npersonas), y = gasto_mensual)) +
+  geom_boxplot(fill = "orange", alpha = 0.6) +
+  labs(title = "Distribución del Gasto según Tamaño del Hogar",
+       x = "Número de Personas", y = "Gasto Mensual ($)") +
+  scale_y_continuous(labels = dollar_format(), limits = c(0, 400000)) + # Limitamos eje Y para ver mejor
+  theme_minimal()
+
+# Imprimir Gráficos
+print(g1)
+print(g2)
+print(g3)
+print(g4)
+```
+
+**Interpretación:**
+
+1.  **Curva Sigmoide:** El primer gráfico muestra claramente una forma de "S". A niveles bajos de ingreso, la probabilidad de tener auto es casi nula; luego crece rápidamente y se estanca en ingresos altos. Esto confirma que un modelo lineal sería incorrecto para la probabilidad y **justifica el uso de Logit**.
+
+2.  **Dispersión Lineal:** El segundo gráfico muestra una correlación positiva. A mayor ingreso, mayor gasto en combustible, lo que valida la teoría económica de bienes normales.
+
+3.  **Educación:** El Boxplot confirma que los hogares con jefe de hogar de educación superior tienden a tener una mediana de gasto mayor.
+
+4.  **Tamaño del Hogar:** El último gráfico valida la inclusión de la variable `npersonas`, mostrando cómo varía la distribución del gasto a medida que aumenta el número de integrantes.
+
+# 5. Modelamiento Econométrico
+
+Se estiman los dos modelos solicitados.
+
+## 5.1 Parte 1: Modelo Logit (Decisión)
+
+Estima la probabilidad $P(Y>0)$.
+
+```{r}
+modelo_logit <- glm(d_gasto ~ log_ingreso + educacion_niv + npersonas, 
+                    data = base_modelo, 
+                    family = binomial(link = "logit"))
+summary(modelo_logit)
+```
+
+Todas las variables (log_ingreso, educacion, npersonas) resultaron estadísticamente significativas al 99%. El coeficiente positivo del ingreso indica que a mayor poder adquisitivo, mayor probabilidad de poseer vehículo y comprar gasolina.
+
+## 5.2 Parte 2: Modelo OLS (Monto)
+
+Estima el valor esperado. Se utiliza el logaritmo del gasto como variable dependiente para corregir la heterocedasticidad y la asimetría de los datos.
+
+```{r}
+base_positiva <- base_modelo %>% filter(gasto_mensual > 0)
+
+modelo_lineal <- lm(log(gasto_mensual) ~ log_ingreso + educacion_niv + npersonas, 
+                    data = base_positiva)
+summary(modelo_lineal)
+```
+
+El R\^2 aproximado de 0.10 es consistente con la literatura de microdatos de corte transversal. Si bien no explica toda la varianza (ya que faltan variables como distancia al trabajo o eficiencia del motor), los coeficientes son significativos y tienen el signo económico correcto.
+
+# 6. Evaluación de Desempeño
+
+Para validar el modelo de clasificación (Logit), utilizamos la curva ROC y la matriz de confusión.
+
+```{r}
+# 1. Curva ROC
+prob_pred <- predict(modelo_logit, type = "response")
+roc_obj <- roc(base_modelo$d_gasto, prob_pred)
+auc_val <- auc(roc_obj)
+
+plot(roc_obj, main = "Curva ROC - Capacidad Discriminante")
+print(paste("Área bajo la curva (AUC):", round(auc_val, 4)))
+
+# 2. Matriz de Confusión
+# Definimos el umbral de corte en 0.5
+pred_clase <- ifelse(prob_pred > 0.5, 1, 0)
+tabla_confusion <- table(Predicho = pred_clase, Real = base_modelo$d_gasto)
+
+print("Matriz de Confusión:")
+print(tabla_confusion)
+
+# Cálculo de Accuracy (Exactitud)
+accuracy <- sum(diag(tabla_confusion)) / sum(tabla_confusion)
+print(paste("Exactitud (Accuracy):", round(accuracy, 4)))
+```
+
+Se obtuvo un **AUC de `0.769`**. En ciencias sociales, un AUC \> 0.7 se considera un modelo con **buena capacidad predictiva**. Esto indica que el modelo es efectivo para distinguir entre hogares con y sin gasto en gasolina.
+
+# 7. Imputación en CASEN y Validación Final
+
+El paso final es aplicar los coeficientes calibrados sobre la base CASEN 2022.
+
+## 7.1 Homologación de Variables
+
+Este paso es crítico. Se debe asegurar que las variables en CASEN tengan la misma definición y nombre que en la EPF. Se realizó un cálculo manual del número de personas y se estandarizaron los niveles educativos.
+
+```{r}
+# 1. Cargar CASEN (Formato RDS para eficiencia)
+casen_2022 <- readRDS("data/casen_rm.rds")
+
+# 2. Proceso de Homologación
+casen_prep <- casen_2022 %>%
+  # Cálculo robusto de integrantes del hogar (evita errores por variables faltantes)
+  add_count(folio, name = "npersonas_calc") %>% 
+  
+  # Filtros de consistencia (Jefes de Hogar con datos válidos)
+  filter(pco1 == 1) %>% 
+  filter(!is.na(esc) & !is.na(ytotcor)) %>%    
+  
+  mutate(
+    # Creación de variables espejo (Mismos nombres que en el modelo)
+    ingreso_pc = ytotcor / npersonas_calc,  
+    log_ingreso = log(ingreso_pc + 1),
+    npersonas = npersonas_calc,
+    
+    # Manejo de categorías no observadas en el entrenamiento
+    educacion_niv = case_when(
+      esc <= 12 ~ "Basica_Media",
+      esc > 12 ~ "Superior",
+      TRUE ~ "Basica_Media" # Asignación por defecto para evitar errores
+    )
+  ) %>%
+  filter(!is.na(ingreso_pc)) 
+
+# 3. Cálculo del Gasto Esperado
+# E(Gasto) = Probabilidad(Logit) * Monto(OLS)
+casen_prep$prob_gasto <- predict(modelo_logit, newdata = casen_prep, type = "response")
+pred_log_monto <- predict(modelo_lineal, newdata = casen_prep)
+casen_prep$monto_condicional <- exp(pred_log_monto) # Transformación inversa del logaritmo
+
+casen_prep$gasto_imputado <- casen_prep$prob_gasto * casen_prep$monto_condicional
+```
+
+## 7.2 Validación de Coherencia
+
+Se comparan las distribuciones de gasto observado (EPF) e imputado (CASEN).
+
+```{r}
+par(mfrow=c(1,2))
+# Histograma EPF
+hist(base_modelo$gasto_mensual[base_modelo$gasto_mensual>0], 
+     main="EPF: Gasto Real", col="skyblue", border="white", 
+     xlab="Monto ($)", probability = TRUE, breaks=30)
+
+# Histograma CASEN
+hist(casen_prep$gasto_imputado[casen_prep$gasto_imputado>1000], 
+     main="CASEN: Gasto Imputado", col="lightgreen", border="white", 
+     xlab="Monto Estimado ($)", probability = TRUE, breaks=30)
+```
+
+Los histogramas muestran que la imputación en CASEN reproduce exitosamente la distribución **log-normal** observada en la EPF (muchos gastos pequeños/medianos y una cola larga de gastos altos). Esto indica que la imputación tiene **coherencia y sentido económico**, validando el modelo para su uso posterior.
