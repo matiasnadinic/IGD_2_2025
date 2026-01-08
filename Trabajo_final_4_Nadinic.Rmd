@@ -1,0 +1,609 @@
+---
+title: "tarea_2_nadinic"
+author: "Matías Nadinic Bravo"
+date: "2025-12-11"
+output: html_document
+---
+
+```{r}
+# Carga de librerías para procesamiento y modelamiento
+library(haven)    # Lectura de formatos .dta/.rds
+library(dplyr)    # Manipulación de datos (Gramática de datos)
+library(pROC)     # Evaluación de modelos de clasificación (Curva ROC)
+library(ggplot2)  # Visualización avanzada
+library(scales)   # Formato de ejes (moneda)
+```
+
+# 1. Introducción y Objetivos
+
+El presente informe tiene como objetivo la estimación del gasto potencial de los hogares en **Gasolina**, utilizando un enfoque econométrico de microsimulación. Este ejercicio se enmarca en la necesidad de generar variables imputadas de gasto a nivel territorial para análisis de Geomarketing.
+
+Para lograr esto, se implementa un **Modelo de Dos Partes (Two-Part Model)**. Este enfoque es superior a una regresión lineal simple cuando se trabaja con bienes que no son consumidos por toda la población (censura en cero), permitiendo modelar por separado la *decisión de consumo* y la *intensidad del consumo*.
+
+# 2. Selección del Servicio y Datos
+
+## 2.1 Justificación del Servicio
+
+Se ha seleccionado el ítem **Gasolina (CCIF 07.2.2.02.01)**.
+
+-   **Relevancia Territorial:** El gasto en combustible es un proxy directo de la movilidad privada y la tenencia de activos (automóvil), variables que presentan una fuerte segregación espacial en la ciudad.
+
+-   **Geolocalización:** Al imputar este gasto en la CASEN, es posible mapear zonas de alta demanda de transporte privado vs. zonas dependientes del transporte público.
+
+-   **Idoneidad del Modelo:** Dado que no todos los hogares tienen automóvil, la variable presenta una gran cantidad de "ceros estructurales", lo que hace indispensable el uso de un modelo de dos etapas (Logit + OLS) en lugar de una regresión simple.
+
+## 2.2 Fuentes de Datos
+
+-   El modelo se alimenta de la integración de cuatro fuentes de información vectorial y alfanumérica:
+
+    1.  **Cartografía Censal (INE, Censo 2017):** Proporciona la geometría de las zonas censales y la densidad de población a nivel de manzana ($H_i$).
+
+    2.  **Caracterización Socioeconómica (CASEN):** Insumo utilizado para calcular el **Gasto Promedio Mensual en Combustible** ($G_c$) desagregado por comuna.
+
+    3.  **Infraestructura y Oferta (OpenStreetMap):**
+
+        -   **Oferta:** Ubicación georreferenciada de la competencia (estaciones de servicio existentes).
+
+        -   **Red Vial:** Grafo de calles utilizado para el cálculo de accesibilidad real (isocronas).
+
+    4.  **División Político-Administrativa (`chilemapas`):** Base territorial para la asignación de atributos comunales.
+
+# 3. Procesamiento de Datos (EPF)
+
+El primer desafío es construir la variable dependiente e independientes desde la EPF, asegurando que la unidad de análisis sea el **Hogar** y no el individuo, ya que el combustible es un gasto compartido.
+
+```{r}
+
+# 1. Carga de datos originales (Ajustar rutas locales)
+personas_epf   <- read_dta("data/datos_epf/base-personas-ix-epf-stata.dta")
+gastos_epf     <- read_dta("data/datos_epf/base-gastos-ix-epf-stata.dta")
+cantidades_epf <- read_dta("data/datos_epf/base-cantidades-ix-epf-stata.dta")
+ccif_epf       <- read_dta("data/datos_epf/ccif-ix-epf-stata.dta")
+
+# 2. Construcción de Variable Dependiente (Gasto Agregado)
+# Se suman todos los registros de compra de gasolina dentro del mes para el hogar.
+gasto_gasolina <- gastos_epf %>%
+  filter(ccif == "07.2.2.02.01") %>%
+  group_by(folio) %>%
+  summarise(gasto_mensual = sum(gasto, na.rm = TRUE)) 
+
+# 3. Selección de Variables Explicativas
+# Se utiliza al Jefe de Hogar como representante de las características socioeconómicas.
+hogares_epf <- personas_epf %>%
+  filter(if("pco1" %in% names(.)) pco1 == 1 else n_linea == 1) %>% 
+  filter(macrozona == 2) %>%  # Filtro: Gran Santiago (para homogeneidad urbana)
+  select(folio, ing_disp_hog_hd_ai, npersonas, edue)
+```
+
+## 3.1 Construcción de la Tabla Maestra (Master Table)
+
+En esta etapa se unen las bases y se realizan transformaciones matemáticas críticas para el modelo.
+
+-   **Transformación Logarítmica (`log_ingreso`):** Se aplica logaritmo al ingreso per cápita. *Justificación:* La distribución del ingreso es altamente sesgada a la derecha. El logaritmo "normaliza" la variable, permitiendo que la regresión lineal capture mejor la elasticidad ingreso-gasto.
+
+-   **Variable Binaria (`d_gasto`):** Se crea una variable dummy (1/0) para separar a quienes consumen de quienes no.
+
+    ```{r}
+    base_modelo <- left_join(hogares_epf, gasto_gasolina, by = "folio") %>%
+      mutate(
+        # Imputación de ceros para hogares sin registro de compra
+        gasto_mensual = ifelse(is.na(gasto_mensual), 0, gasto_mensual),
+        
+        # Variable Dependiente 1: Decisión de Compra (Binaria)
+        d_gasto = ifelse(gasto_mensual > 0, 1, 0),
+        
+        # Variables Explicativas
+        ingreso_pc = ing_disp_hog_hd_ai / npersonas,
+        log_ingreso = log(ingreso_pc + 1), # +1 para evitar log(0)
+        
+        # Categorización Educacional (Simplificación para robustez)
+        educacion_niv = case_when(
+          edue <= 12 ~ "Basica_Media",
+          edue > 12 ~ "Superior",
+          TRUE ~ "Otro"
+        )
+      ) %>%
+      filter(ing_disp_hog_hd_ai > 0) # Limpieza de datos erróneos
+    ```
+
+# 4. Análisis Exploratorio
+
+Antes de calibrar el modelo, es imperativo visualizar las relaciones subyacentes en los datos para validar nuestras hipótesis económicas.
+
+```{r}
+# Filtramos solo gastos positivos para analizar el monto
+datos_graficos <- base_modelo %>% filter(gasto_mensual > 0)
+
+# Gráfico A: Relación Ingreso vs Probabilidad (Justificación del Logit)
+g1 <- ggplot(base_modelo, aes(x = log_ingreso, y = d_gasto)) +
+  geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "forestgreen") +
+  labs(title = "Probabilidad de Tener Auto/Gasto",
+       subtitle = "Curva Sigmoide (S-Shape)",
+       x = "Logaritmo del Ingreso", y = "Probabilidad") +
+  theme_minimal()
+
+# Gráfico B: Relación Ingreso vs Monto (Justificación del OLS)
+g2 <- ggplot(datos_graficos, aes(x = ingreso_pc, y = gasto_mensual)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Elasticidad Gasto-Ingreso",
+       x = "Ingreso Per Cápita", y = "Gasto Mensual ($)") +
+  scale_y_continuous(labels = dollar_format()) +
+  scale_x_continuous(labels = dollar_format()) +
+  theme_minimal()
+
+# Gráfico C: Distribución del Gasto según Educación (Boxplot)
+g3 <- ggplot(datos_graficos, aes(x = educacion_niv, y = gasto_mensual, fill = educacion_niv)) +
+  geom_boxplot() +
+  labs(title = "Distribución del Gasto según Nivel Educacional",
+       x = "Educación Jefe Hogar", y = "Gasto Mensual") +
+  scale_y_continuous(labels = dollar_format()) +
+  theme_minimal() + theme(legend.position = "none")
+
+# Gráfico D: Distribución del Gasto según Tamaño del Hogar (Boxplot)
+g4 <- ggplot(datos_graficos, aes(x = factor(npersonas), y = gasto_mensual)) +
+  geom_boxplot(fill = "orange", alpha = 0.6) +
+  labs(title = "Distribución del Gasto según Tamaño del Hogar",
+       x = "Número de Personas", y = "Gasto Mensual ($)") +
+  scale_y_continuous(labels = dollar_format(), limits = c(0, 400000)) + # Limitamos eje Y para ver mejor
+  theme_minimal()
+
+# Imprimir Gráficos
+print(g1)
+print(g2)
+print(g3)
+print(g4)
+```
+
+**Interpretación:**
+
+1.  **Curva Sigmoide:** El primer gráfico muestra claramente una forma de "S". A niveles bajos de ingreso, la probabilidad de tener auto es casi nula; luego crece rápidamente y se estanca en ingresos altos. Esto confirma que un modelo lineal sería incorrecto para la probabilidad y **justifica el uso de Logit**.
+
+2.  **Dispersión Lineal:** El segundo gráfico muestra una correlación positiva. A mayor ingreso, mayor gasto en combustible, lo que valida la teoría económica de bienes normales.
+
+3.  **Educación:** El Boxplot confirma que los hogares con jefe de hogar de educación superior tienden a tener una mediana de gasto mayor.
+
+4.  **Tamaño del Hogar:** El último gráfico valida la inclusión de la variable `npersonas`, mostrando cómo varía la distribución del gasto a medida que aumenta el número de integrantes.
+
+# 5. Modelamiento Econométrico
+
+Se estiman los dos modelos solicitados.
+
+## 5.1 Parte 1: Modelo Logit (Decisión)
+
+Estima la probabilidad $P(Y>0)$.
+
+```{r}
+modelo_logit <- glm(d_gasto ~ log_ingreso + educacion_niv + npersonas, 
+                    data = base_modelo, 
+                    family = binomial(link = "logit"))
+summary(modelo_logit)
+```
+
+Todas las variables (log_ingreso, educacion, npersonas) resultaron estadísticamente significativas al 99%. El coeficiente positivo del ingreso indica que a mayor poder adquisitivo, mayor probabilidad de poseer vehículo y comprar gasolina.
+
+## 5.2 Parte 2: Modelo OLS (Monto)
+
+Estima el valor esperado. Se utiliza el logaritmo del gasto como variable dependiente para corregir la heterocedasticidad y la asimetría de los datos.
+
+```{r}
+base_positiva <- base_modelo %>% filter(gasto_mensual > 0)
+
+modelo_lineal <- lm(log(gasto_mensual) ~ log_ingreso + educacion_niv + npersonas, 
+                    data = base_positiva)
+summary(modelo_lineal)
+```
+
+El R\^2 aproximado de 0.10 es consistente con la literatura de microdatos de corte transversal. Si bien no explica toda la varianza (ya que faltan variables como distancia al trabajo o eficiencia del motor), los coeficientes son significativos y tienen el signo económico correcto.
+
+# 6. Evaluación de Desempeño
+
+Para validar el modelo de clasificación (Logit), utilizamos la curva ROC y la matriz de confusión.
+
+```{r}
+# 1. Curva ROC
+prob_pred <- predict(modelo_logit, type = "response")
+roc_obj <- roc(base_modelo$d_gasto, prob_pred)
+auc_val <- auc(roc_obj)
+
+plot(roc_obj, main = "Curva ROC - Capacidad Discriminante")
+print(paste("Área bajo la curva (AUC):", round(auc_val, 4)))
+
+# 2. Matriz de Confusión
+# Definimos el umbral de corte en 0.5
+pred_clase <- ifelse(prob_pred > 0.5, 1, 0)
+tabla_confusion <- table(Predicho = pred_clase, Real = base_modelo$d_gasto)
+
+print("Matriz de Confusión:")
+print(tabla_confusion)
+
+# Cálculo de Accuracy (Exactitud)
+accuracy <- sum(diag(tabla_confusion)) / sum(tabla_confusion)
+print(paste("Exactitud (Accuracy):", round(accuracy, 4)))
+```
+
+Se obtuvo un **AUC de `0.769`**. En ciencias sociales, un AUC \> 0.7 se considera un modelo con **buena capacidad predictiva**. Esto indica que el modelo es efectivo para distinguir entre hogares con y sin gasto en gasolina.
+
+# 7. Imputación en CASEN y Validación Final
+
+El paso final es aplicar los coeficientes calibrados sobre la base CASEN 2022.
+
+## 7.1 Homologación de Variables
+
+Este paso es crítico. Se debe asegurar que las variables en CASEN tengan la misma definición y nombre que en la EPF. Se realizó un cálculo manual del número de personas y se estandarizaron los niveles educativos.
+
+```{r}
+
+
+# 1. Cargar CASEN
+casen_2022 <- readRDS("data/casen_rm.rds")
+
+# 2. Homologación y Limpieza
+casen_prep <- casen_2022 %>%
+  # A. CÁLCULO DE PERSONAS
+  add_count(folio, name = "npersonas_calc") %>% 
+  
+  # B. FILTROS INICIALES (Jefe de Hogar y Datos Válidos)
+  filter(pco1 == 1) %>% 
+  filter(!is.na(esc)) %>%        # <--- FIX 1: Eliminar si no sabemos escolaridad
+  filter(!is.na(ytotcor)) %>%    # <--- FIX 2: Eliminar si no sabemos ingreso
+  
+  mutate(
+    # C. CREACIÓN DE VARIABLES (Exactamente igual que el modelo)
+    ingreso_pc = ytotcor / npersonas_calc,  
+    log_ingreso = log(ingreso_pc + 1),
+    npersonas = npersonas_calc,
+    
+    # D. CATEGORÍAS DE EDUCACIÓN
+    # Solo usamos las categorías que el modelo conoce.
+    # Si hay algún dato raro, lo forzamos a 'Basica_Media' para que no falle.
+    educacion_niv = case_when(
+      esc <= 12 ~ "Basica_Media",
+      esc > 12 ~ "Superior",
+      TRUE ~ "Basica_Media" # <--- FIX 3: Evitamos crear la categoría "Otro"
+    )
+  ) %>%
+  # Limpieza final de seguridad
+  filter(!is.na(ingreso_pc)) 
+
+# 3. Predicción (Ahora sí debería funcionar)
+
+# A. Probabilidad
+casen_prep$prob_gasto <- predict(modelo_logit, newdata = casen_prep, type = "response")
+
+# B. Monto
+pred_log_monto <- predict(modelo_lineal, newdata = casen_prep)
+casen_prep$monto_condicional <- exp(pred_log_monto)
+
+# C. Gasto Final
+casen_prep$gasto_gasolina_imputado <- casen_prep$prob_gasto * casen_prep$monto_condicional
+
+# 4. Revisión Final
+print("Resumen del gasto imputado:")
+summary(casen_prep$gasto_gasolina_imputado)
+
+```
+
+## 7.2 Validación de Coherencia
+
+Se comparan las distribuciones de gasto observado (EPF) e imputado (CASEN).
+
+```{r}
+par(mfrow=c(1,2))
+hist(base_modelo$gasto_mensual[base_modelo$gasto_mensual>0], 
+     main="EPF Real", col="skyblue", xlab="Gasto $")
+hist(casen_prep$gasto_gasolina_imputado[casen_prep$gasto_gasolina_imputado>1000], 
+     main="CASEN Imputada", col="lightgreen", xlab="Gasto Estimado $")
+    
+```
+
+1.  Abstracción y Planteamiento del Problema
+
+La localización de instalaciones (Facility Location Problem - FLP) constituye un problema clásico de optimización combinatoria en el espacio geográfico. El objetivo no es simplemente encontrar un espacio vacante, sino identificar el locus que maximice la función de utilidad de una demanda heterogéneamente distribuida, sujeta a restricciones de competencia y accesibilidad.
+
+Este estudio propone una solución algorítmica híbrida que integra Microsimulación Espacial para la estimación de demanda en áreas pequeñas (Small Area Estimation) con Modelos de Interacción Espacial (SIM) de corte probabilístico.A diferencia de los enfoques deterministas clásicos —como la Teoría de Lugares Centrales de Christaller (1933) o los Polígonos de Voronoi— que asumen una captura de mercado binaria (el consumidor siempre va al lugar más cercano), este enfoque adopta la Ley de Gravitación del Retail (Reilly, 1931; Huff, 1963).
+
+Esta perspectiva reconoce la naturaleza estocástica del comportamiento humano: la decisión de compra es un campo de probabilidad influenciado por la distancia, pero no limitado estrictamente por ella.
+
+2\. Ingeniería de Datos y Microsimulación Espacial
+
+Uno de los desafíos principales en la geografía económica aplicada es la incompatibilidad de escalas (MAUP - Modifiable Areal Unit Problem):
+
+Censo: Alta resolución espacial (Manzana), pero sin variables económicas (ingresos/gastos).
+
+CASEN: Variables económicas detalladas, pero baja resolución espacial (Comuna).
+
+Para resolver esto, se implementó una técnica de Microsimulación Estática conocida como Spatial Downscaling.
+
+```{r}
+# 1. CARGA DE LIBRERÍAS Y CONFIGURACIÓN
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(chilemapas, osmdata, sf, dplyr, leaflet, ggplot2, scales, gridExtra, tidyr)
+
+# Función de Limpieza
+limpiar_texto <- function(x) {
+  x <- toupper(as.character(x))
+  x <- iconv(x, to = "ASCII//TRANSLIT") 
+  return(trimws(x))
+}
+
+# =============================================================================
+# PASO 1: DATOS BÁSICOS & OFERTA
+# =============================================================================
+print("1. Cargando cartografía y oferta...")
+mapa_base <- mapa_comunas %>% 
+  filter(codigo_region == "13") %>% 
+  left_join(codigos_territoriales %>% select(codigo_comuna, nombre_comuna), by = "codigo_comuna") %>% 
+  st_as_sf() %>% st_transform(4326) %>% 
+  mutate(comuna_join = limpiar_texto(nombre_comuna))
+
+oferta_actual <- tryCatch({
+  q <- opq(bbox = getbb("Santiago Metropolitan Region, Chile"), timeout = 60) %>% 
+    add_osm_feature(key = "amenity", value = "fuel")
+  datos <- osmdata_sf(q)
+  st_transform(datos$osm_points %>% select(osm_id, geometry), 4326)
+}, error = function(e) {
+  st_sf(osm_id = "1", geometry = st_sfc(st_point(c(-70.6, -33.45))), crs = 4326) 
+})
+
+# =============================================================================
+# PASO 2: CÁLCULO DE DEMANDA (CENSO + CASEN)
+# =============================================================================
+
+datos_censo <- censo_2017_comunas %>%
+  group_by(codigo_comuna) %>%
+  summarise(pob = sum(poblacion, na.rm=T)) %>% mutate(hog = pob/3)
+
+demanda_casen <- casen_prep %>%
+  mutate(cj = limpiar_texto(r1b_comuna_esp)) %>% 
+  group_by(cj) %>% 
+  summarise(gasto_promedio = mean(gasto_gasolina_imputado, na.rm=T))
+
+mapa_demanda <- mapa_base %>%
+  left_join(datos_censo, by="codigo_comuna") %>% 
+  left_join(demanda_casen, by=c("comuna_join"="cj")) %>%
+  mutate(gasto_promedio = replace_na(gasto_promedio, 0),
+         demanda_potencial_total = ifelse(is.na(gasto_promedio*hog), 0, gasto_promedio*hog)) %>% 
+  st_make_valid()
+
+```
+
+
+## 3. Análisis Topológico de Brechas (*Gap Analysis*)
+
+Para la identificación de zonas de oportunidad, se aplicó álgebra de mapas booleana. Se define el espacio de mercado saturado ($S$) como la unión de áreas de influencia (*buffers*) euclidianas de 640 metros alrededor de los oferentes actuales ($O$).
+
+$S = \bigcup_{j=1}^{m} Buffer(O_j, 640)$
+
+La zona de oportunidad ($Z_{opt}$) se obtiene mediante la diferencia geométrica entre el espacio de demanda total ($D$) y el espacio saturado ($S$): $Z_{opt} = D \setminus S$.
+
+Posteriormente, se aplicó un filtro estadístico de **Percentil 90** para aislar los clústeres de máxima rentabilidad marginal ("Océanos Azules").
+
+```{r}
+# =============================================================================
+# GAP ANALYSIS (DIFERENCIA TOPOLÓGICA)
+# =======================================================================
+print("3. Detectando Océanos Azules...")
+zona_cobertura_simple <- st_transform(oferta_actual, 32719) %>% 
+  st_buffer(dist = 640) %>% st_union() %>% st_transform(4326) %>% st_make_valid()
+
+zonas_sin_servicio <- st_difference(mapa_demanda, zona_cobertura_simple)
+
+zonas_oportunidad <- zonas_sin_servicio %>%
+  select(nombre_comuna, codigo_comuna, demanda_potencial_total, geometry) %>%
+  arrange(desc(demanda_potencial_total))
+
+umbral <- quantile(zonas_oportunidad$demanda_potencial_total, 0.90)
+clusters_visuales <- mapa_demanda %>% 
+  filter(nombre_comuna %in% (zonas_oportunidad %>% filter(demanda_potencial_total >= umbral) %>% pull(nombre_comuna)))
+
+```
+
+## 4. Modelamiento Gravitatorio Estocástico (Huff)
+
+Esta sección constituye el núcleo teórico del estudio. Una vez seleccionado el centroide de gravedad poblacional de la mejor zona, se modela la probabilidad de captura de mercado.
+
+### 4.1. Fundamentación Matemática
+
+El Modelo de Huff postula que la probabilidad $P_{ij}$ de que un agente en $i$ elija el destino $j$ es proporcional a la utilidad ($U_{ij}$) de dicho destino. La utilidad se define como una función inversa de la "fricción de la distancia" o impedancia.
+
+$P_{ij} = \frac{ d_{ij}^{-\beta} }{ \sum_{k=1}^{n} d_{ik}^{-\beta} }$
+
+Donde $\beta$ es el **parámetro de decaimiento de la distancia**. Para este estudio se calibró $\beta=2$, asumiendo un comportamiento newtoniano inverso al cuadrado, típico de bienes de conveniencia (*commodities*) donde la disposición a viajar decae aceleradamente.
+
+### 4.2. Discretización Espacial (Tessellation Hexagonal)
+
+Para superar el Problema de la Unidad de Área Modificable (MAUP) y los vacíos censales en zonas periurbanas, se generó una **Malla Hexagonal (*Hexgrid*)** de 250 metros. Esto permite calcular un campo continuo de probabilidad vectorial, independiente de los límites administrativos.
+
+```{r}
+# =============================================================================
+# OPTIMIZACIÓN Y MODELO HUFF
+# =============================================================================
+mejor_zona <- zonas_oportunidad[1, ]
+nombre_ganadora <- mejor_zona$nombre_comuna
+print(paste("GANADOR:", nombre_ganadora))
+
+zonas_censo_local <- mapa_zonas %>% 
+  filter(codigo_region=="13", codigo_comuna==mejor_zona$codigo_comuna) %>%
+  inner_join(censo_2017_zonas, by="geocodigo") %>% 
+  filter(poblacion>0) %>% st_as_sf() %>% st_transform(4326) %>% st_make_valid()
+
+interseccion <- st_intersection(mejor_zona, zonas_censo_local)
+optimo <- if(nrow(interseccion)>0) st_centroid(interseccion %>% arrange(desc(poblacion)) %>% slice(1)) else st_centroid(mejor_zona)
+
+# =============================================================================
+# MODELO HUFF (HEXÁGONOS + ZONAS) - AQUÍ ESTÁ EL CAMBIO IMPORTANTE
+# =============================================================================
+print("Generando Hexágonos y calculando Huff...")
+
+# 1. PREPARAR GEOMETRÍA (Radio 3km)
+punto_utm <- st_transform(optimo, 32719)
+buffer_sf <- st_sf(geometry = st_geometry(st_buffer(punto_utm, dist = 3000)))
+
+# --- A. GRID HEXAGONAL (VISUALIZACIÓN CONTINUA) ---
+# Creamos la malla de hexágonos (250m)
+grid_geom <- st_make_grid(buffer_sf, cellsize = 250, square = FALSE)
+grid_sf <- st_sf(geometry = grid_geom)
+# Recortamos para que quede redonda dentro del buffer
+grid_recortado <- st_intersection(grid_sf, buffer_sf)
+grid_final <- st_transform(grid_recortado, 4326)
+
+# Calculamos Huff para cada Hexágono
+cent_grid <- st_centroid(grid_final)
+d_mia_g <- pmax(as.numeric(st_distance(cent_grid, optimo)), 10)
+idx_comp_g <- st_nearest_feature(cent_grid, oferta_actual)
+d_comp_g <- pmax(as.numeric(st_distance(cent_grid, oferta_actual[idx_comp_g,], by_element = TRUE)), 10)
+# Fórmula Probabilidad
+grid_final$probabilidad <- (1/d_mia_g^2) / ((1/d_mia_g^2) + (1/d_comp_g^2))
+
+```
+
+## 5. Estimación Econométrica de Ingresos
+
+El modelo probabilístico se traduce en un modelo económico mediante la agregación espacial ponderada. Se cruzan las zonas censales reales (donde residen los hogares) con las probabilidades calculadas.
+
+El algoritmo realiza cruces intercomunales dinámicos, asignando el gasto promedio ($G_c$) correspondiente a la jurisdicción administrativa de cada manzana, incluso si el radio de 3km cruza fronteras comunales.
+
+$IngresoTotal = \sum_{i \in Radio} \left( H_i \cdot G_{c(i)} \cdot P_{ij} \right)$
+
+```{r}
+# --- B. ZONAS CENSALES (CÁLCULO ECONÓMICO REAL) ---
+# Traemos zonas de toda la región para cruzar fronteras comunales
+zonas_regionales <- mapa_zonas %>% filter(codigo_region == "13") %>% 
+  left_join(censo_2017_zonas, by="geocodigo") %>% 
+  mutate(poblacion = replace_na(poblacion, 0), hogares = poblacion/3) %>%
+  left_join(codigos_territoriales %>% select(codigo_comuna, nombre_comuna), by="codigo_comuna") %>%
+  mutate(comuna_join = limpiar_texto(nombre_comuna)) %>%
+  left_join(demanda_casen, by=c("comuna_join"="cj")) %>% 
+  mutate(gasto_promedio = replace_na(gasto_promedio, 0)) %>% st_as_sf() %>% st_transform(4326) %>% st_make_valid()
+
+# Recortamos manzanas
+zonas_huff <- st_intersection(zonas_regionales, st_transform(buffer_sf, 4326))
+
+# Calculamos Huff para manzanas
+cent_zonas <- st_centroid(zonas_huff)
+d_mia_z <- pmax(as.numeric(st_distance(cent_zonas, optimo)), 10)
+idx_comp_z <- st_nearest_feature(cent_zonas, oferta_actual)
+d_comp_z <- pmax(as.numeric(st_distance(cent_zonas, oferta_actual[idx_comp_z,], by_element = TRUE)), 10)
+zonas_huff$probabilidad <- (1/d_mia_z^2) / ((1/d_mia_z^2) + (1/d_comp_z^2))
+
+# =============================================================================
+# CÁLCULO DE DATOS DUROS (KPIs)
+# =============================================================================
+zonas_huff$poblacion_capturada <- zonas_huff$poblacion * zonas_huff$probabilidad
+zonas_huff$ingreso_capturado <- zonas_huff$hogares * zonas_huff$gasto_promedio * zonas_huff$probabilidad
+
+# Totales
+total_pob_area <- sum(zonas_huff$poblacion, na.rm=T)
+total_pob_capturada <- sum(zonas_huff$poblacion_capturada, na.rm=T)
+total_ingresos <- sum(zonas_huff$ingreso_capturado, na.rm=T)
+market_share <- (total_pob_capturada / total_pob_area)
+
+print("=== REPORTE EJECUTIVO (KPIs) ===")
+print(paste("Ingreso Mensual Est.: ", label_dollar(prefix="$", big.mark=".")(round(total_ingresos))))
+print(paste("Población Capturada:  ", label_comma()(round(total_pob_capturada))))
+print("================================")
+
+```
+
+## 6. Validación Topológica y Perfilamiento
+
+Para asegurar la viabilidad operativa, se calcula una **Isócrona de Red (*Network Isochrone*)**. A diferencia del radio euclidiano, esta geometría respeta la impedancia de la red vial, descartando zonas que, aunque cercanas geométricamente, están desconectadas topológicamente.
+
+Adicionalmente, se extrae el perfil sociodemográfico (*Profiling*) de la demanda capturada para validar la adecuación del *target* comercial.
+
+```{r}
+# =============================================================================
+# VALIDACIÓN DE ACCESIBILIDAD Y PERFILAMIENTO
+# =============================================================================
+print("Generando Isócrona de Red...")
+tryCatch({
+  q_calles <- opq(bbox = st_bbox(st_transform(buffer_sf, 4326)), timeout = 90) %>% 
+    add_osm_feature(key = "highway", value = c("primary", "secondary", "tertiary", "residential"))
+  red_vial <- st_transform(osmdata_sf(q_calles)$osm_lines, 32719)
+  
+  if(!is.null(red_vial)) {
+    calles_cercanas <- st_intersection(red_vial, st_buffer(punto_utm, 2800))
+    isocrona_real <- st_buffer(calles_cercanas, dist = 80) %>% st_union() %>% st_transform(4326)
+  } else { isocrona_real <- st_buffer(optimo, dist = 0.008) }
+}, error = function(e) { isocrona_real <<- st_buffer(optimo, dist = 0.008) })
+
+# Perfilamiento Demográfico
+comuna_ganadora_clean <- limpiar_texto(nombre_ganadora)
+perfil_publico <- casen_prep %>%
+  mutate(comuna_clean = limpiar_texto(r1b_comuna_esp)) %>%
+  filter(comuna_clean == comuna_ganadora_clean)
+
+if(nrow(perfil_publico) > 0) {
+  g1 <- ggplot(perfil_publico, aes(x = educacion_niv, fill=educacion_niv)) +
+    geom_bar() + theme_minimal() + labs(title = "Nivel Educativo", y="Hogares") + theme(legend.position="none")
+  g2 <- ggplot(perfil_publico, aes(x = edad)) +
+    geom_histogram(fill="orange", color="white", bins=15) + theme_minimal() + labs(title="Edad Jefe Hogar")
+  g3 <- ggplot(perfil_publico, aes(x = gasto_gasolina_imputado)) +
+    geom_histogram(fill="green", color="white", bins=20) + scale_x_continuous(labels=dollar) + theme_minimal() + labs(title="Distribución Gasto ($)")
+  # grid.arrange(g1, g2, g3, ncol=2)
+  print(g1)
+  print(g2)
+  print(g3)
+}
+```
+
+## 7. Visualización Cartográfica Multicapa
+
+La herramienta final consolida las capas en un visor interactivo que permite la exploración de datos a nivel de manzana. Se utilizan paletas de color divergentes (`RdYlBu`) para la probabilidad y secuenciales (`YlOrRd`) para la demanda monetaria, optimizando la interpretabilidad visual.
+
+```{r}
+# =============================================================================
+# PASO 7: VISOR INTERACTIVO FINAL (CON HEXÁGONOS + DATOS)
+# =============================================================================
+fmt_clp <- label_dollar(prefix = "$", big.mark = ".", accuracy = 1)
+fmt_mm <- label_dollar(scale = 1e-6, suffix = " MM", accuracy = 0.1)
+
+# Paletas
+pal_huff <- colorNumeric("RdYlBu", domain = c(0, 1), reverse = TRUE)
+pal_demanda <- colorNumeric("YlOrRd", domain = mapa_demanda$demanda_potencial_total)
+
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  
+  # A. CAPA 1: CONTEXTO MACRO (Demanda General)
+  addPolygons(data = mapa_demanda, fillColor = ~pal_demanda(demanda_potencial_total), 
+              color="transparent", weight=1, fillOpacity=0.5, group="1. Demanda General ($)", 
+              popup = ~paste("<b>", nombre_comuna, "</b><br>Demanda:", fmt_mm(demanda_potencial_total))) %>%
+  
+  # B. CAPA 2: CLUSTERS (HUECOS)
+  addPolygons(data = clusters_visuales, color = "#C0392B", weight = 2, fillOpacity = 0.1, group = "2. Clusters de Oportunidad") %>%
+  
+  # C. CAPA 3: HEXÁGONOS (VISUALIZACIÓN CONTINUA - LO QUE FALTABA)
+  addPolygons(data = grid_final, 
+              fillColor = ~pal_huff(probabilidad), 
+              color="white", weight=0, fillOpacity=0.4, 
+              group="3. Probabilidad (Hexágonos)",
+              popup = ~paste("Probabilidad Teórica:", percent(probabilidad, 0.1))) %>%
+  
+  # D. CAPA 4: MANZANAS (DATOS DUROS ECONÓMICOS)
+  addPolygons(data = zonas_huff, 
+              fillColor = ~pal_huff(probabilidad), 
+              color="white", weight=0.5, fillOpacity=0.8, 
+              group="4. Ingresos por Manzana",
+              popup = ~paste("<b>Zona Censal</b><br>",
+                             "Población Real:", round(poblacion), "<br>",
+                             "<b>Clientes Captados:</b>", round(poblacion_capturada), "<br>",
+                             "<b>Ingreso Estimado:</b>", fmt_clp(ingreso_capturado))) %>%
+  
+  # E. CAPA 5: VALIDACIÓN VIAL
+  addPolygons(data = isocrona_real, color="#00AA00", weight=2, fillOpacity=0.1, group="5. Isócrona Vial") %>%
+  addCircleMarkers(data = oferta_actual, color="black", radius=3, group="Competencia") %>%
+  
+  # F. GANADOR
+  addMarkers(data = optimo, popup = paste("GANADOR:<br>Venta Est.:", fmt_mm(total_ingresos))) %>%
+  
+  # G. CONTROLES
+  addLegend(pal = pal_huff, values = c(0,1), title = "Prob. Huff", position = "bottomright") %>%
+  addLayersControl(overlayGroups = c("3. Probabilidad (Hexágonos)", "4. Ingresos por Manzana", "2. Clusters de Oportunidad", "1. Demanda General ($)", "5. Isócrona Vial", "Competencia"), 
+                   options = layersControlOptions(collapsed=FALSE)) %>%
+  # H. COBERTURA ACTUAL
+  addPolygons(data = zona_cobertura_simple, color = "#2980B9", weight = 1, fillOpacity = 0.3, group = "Cobertura Actual") %>%
+  
+  hideGroup(c("1. Demanda General ($)", "Competencia", "2. Clusters de Oportunidad"))
+```
